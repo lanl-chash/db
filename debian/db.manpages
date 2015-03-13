@@ -1,0 +1,12 @@
+man/dbsplit.1
+man/dbfilter-cidr.1
+man/jsonsql.1
+man/jsonsort.1
+man/dbsqawk.1
+man/jsoncat.1
+man/dbstrip.1
+man/db2json.1
+man/jsonsplit.1
+man/dbcat.1
+man/db2sqlite.1
+man/dbsort.1

@@ -1,0 +1,1040 @@
+#!/usr/bin/env python
+# vim: ts=4 et sw=4 sts=4 syntax=python
+
+"""dbsqawk
+
+Copyright (c) 2015, Los Alamos National Security, LLC
+All rights reserved.
+
+Copyright (2015). Los Alamos National Security, LLC. This software was produced
+under U.S. Government contract DE-AC52-06NA25396 for Los Alamos National
+Laboratory (LANL), which is operated by Los Alamos National Security, LLC for
+the U.S. Department of Energy. The U.S. Government has rights to use,
+reproduce, and distribute this software. NEITHER THE GOVERNMENT NOR LOS ALAMOS
+NATIONAL SECURITY, LLC MAKES ANY WARRANTY, EXPRESS OR IMPLIED, OR ASSUMES ANY
+LIABILITY FOR THE USE OF THIS SOFTWARE. If software is modified to produce
+derivative works, such modified software should be clearly marked, so as not to
+confuse it with the version available from LANL.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+SQL query evaluation on flat files using awk.
+
+Author: Curt Hash <chash@lanl.gov>
+
+"""
+
+import argparse
+import distutils.spawn
+import os
+import sys
+
+from pyparsing import alphanums, alphas, CaselessKeyword, Combine, \
+    delimitedList, Forward, Keyword, nums, oneOf, opAssoc, \
+    operatorPrecedence, Optional, Or, ParseException, ParserElement, \
+    QuotedString, Suppress, Word, ZeroOrMore
+
+import db
+
+
+# This enables memoization in pyparsing. It's very slow without it.
+ParserElement.enablePackrat()
+
+
+class NumericLiteral(object):
+
+    """Numeric constant. """
+
+    def __init__(self, tokens):
+        self.literal = tokens[0]
+        self.aggregate = False
+
+    def awk(self, schema):
+        """Returns the number. """
+        return self.literal
+
+    def datatype(self, schema):
+        """Returns the type. """
+        if '.' in self.literal:
+            return 'real'
+
+        return 'int'
+
+
+class StringLiteral(object):
+
+    """String constant. """
+
+    def __init__(self, tokens):
+        self.literal = tokens[0]
+        self.aggregate = False
+
+    def awk(self, schema):
+        """Returns the quoted string. """
+        return '"%s"' % self.literal
+
+    def datatype(self, schema):
+        """Returns the type. """
+        return 'str'
+
+
+class RegexLiteral(object):
+
+    """Regex constant. """
+
+    def __init__(self, tokens):
+        self.literal = tokens[0]
+        self.aggregate = False
+
+    def awk(self, schema):
+        """Returns the pattern. """
+        return '/%s/' % self.literal
+
+    def datatype(self, schema):
+        """Returns the type. """
+        return 'int'
+
+
+class ColumnName(object):
+
+    """Column reference. """
+
+    def __init__(self, tokens):
+        self.column = tokens[0]
+        self.aggregate = False
+
+    def awk(self, schema):
+        """Returns the field variable corresponding to the column name. """
+        if self.column == '*':
+            return '$0'
+
+        return '$%d' % (schema[self.column][0] + 1)
+
+    def datatype(self, schema):
+        """Returns the type. """
+        return schema[self.column][1]
+
+
+class UnaryExpression(object):
+
+    """Unary expression. """
+
+    def __init__(self, tokens):
+        self.oper, self.operand = tokens[0]
+        self.aggregate = self.operand.aggregate
+
+    def awk(self, schema):
+        """Returns the equivalent awk expression. """
+        assert not self.aggregate
+
+        return self.oper + self.operand.awk(schema)
+
+    def awk_update(self, schema):
+        """Returns awk code that updates the incremental state of the aggregate
+        operand.
+
+        """
+        assert self.aggregate
+
+        return self.operand.awk_update(schema)
+
+    def awk_final(self, schema):
+        """Returns awk code that evaluates the final value of the aggregate
+        expression.
+
+        """
+        assert self.aggregate
+
+        return self.oper + self.operand.awk_final(schema)
+
+    def datatype(self, schema):
+        """Returns the type. """
+        return self.operand.datatype(schema)
+
+
+class BinaryExpression(object):
+
+    """Binary expression. """
+
+    def __init__(self, tokens):
+        self.tokens = tokens[0]
+        self.operand = self.tokens[0]
+
+        operator_map = {
+            '=' : '==',
+            '||' : ' ',
+            'and' : '&&',
+            'or' : '||'
+        }
+
+        rest = self.tokens[1:]
+        self.pairs = [(operator_map.get(oper.lower(), oper.lower()), operand)
+                      for oper, operand in zip(rest[::2], rest[1::2])]
+
+        self.aggregate = (self.operand.aggregate or
+                          any(operand.aggregate for _, operand in self.pairs))
+
+    def awk(self, schema):
+        """Returns the equivalent awk expression. """
+        assert not self.aggregate
+
+        expr = [self.operand.awk(schema)]
+        for oper, operand in self.pairs:
+            value = operand.awk(schema)
+
+            if oper == 'not like':
+                oper = '!~'
+                value = 'like2regex(%s)' % value
+            elif oper == 'like':
+                oper = '~'
+                value = 'like2regex(%s)' % value
+
+            expr.append(oper)
+            expr.append(value)
+
+        return '(' + ' '.join(expr) + ')'
+
+    def awk_update(self, schema):
+        """Returns awk code that updates the incremental state of the aggregate
+        operand(s).
+
+        """
+        assert self.aggregate
+
+        code = []
+
+        if self.operand.aggregate:
+            code.append(self.operand.awk_update(schema))
+
+        for _, operand in self.pairs:
+            if operand.aggregate:
+                code.append(operand.awk_update(schema))
+
+        return '\n'.join(code)
+
+    def awk_final(self, schema):
+        """Returns awk code that evaluates the final value of the aggregate
+        expression.
+
+        """
+        assert self.aggregate
+
+        expr = []
+
+        if self.operand.aggregate:
+            expr.append(self.operand.awk_final(schema))
+        else:
+            expr.append(self.operand.awk(schema))
+
+        for oper, operand in self.pairs:
+            if operand.aggregate:
+                value = operand.awk_final(schema)
+            else:
+                value = operand.awk(schema)
+
+            if oper == 'not like':
+                oper = '!~'
+                value = 'like2regex(%s)' % value
+            elif oper == 'like':
+                oper = '~'
+                value = 'like2regex(%s)' % value
+
+            expr.append(oper)
+            expr.append(value)
+
+        return '(%s)' % ' '.join(expr)
+
+    def datatype(self, schema):
+        """Returns the type. """
+        oper = self.pairs[0][0]
+
+        if oper in ['^', '+', '-', '*']:
+            types = set(operand.datatype(schema) for _, operand in self.pairs)
+            types.add(self.operand.datatype(schema))
+
+            if 'real' in types:
+                return 'real'
+
+            return 'int'
+
+        if oper in ['/', '%']:
+            return 'real'
+
+        if oper in ['<', '<=', '>', '>=', '==', '!=', '~', '!~', '&&', '||']:
+            return 'int'
+
+        if oper == ' ':
+            return 'str'
+
+        raise ValueError(oper)
+
+
+class AggregateFunction(object):
+
+    """Aggregate function (e.g., count). """
+
+    def __init__(self, tokens):
+        self.function = tokens[0].lower()
+
+        if type(tokens[1]) == str and tokens[1].lower() == 'distinct':
+            self.distinct = True
+            self.arg = tokens[2]
+        else:
+            self.distinct = False
+            self.arg = tokens[1]
+
+        self._statevar = 'state%d' % id(self)
+
+        self.aggregate = True
+
+    def awk_update(self, schema):
+        """Returns awk code that updates the incremental state of the aggregate
+        function.
+
+        The code should reference the current partition using the `part`
+        variable.
+
+        """
+        if self.arg == '*':
+            value = '$0'
+        else:
+            value = self.arg.awk(schema)
+
+        code = []
+
+        if self.distinct:
+            code.append('''
+                # Distinct check
+                if (%(SV)s[part,"set",%(VALUE)s] == "") {
+                    # Value has not been seen before
+                    %(SV)s[part,"set",%(VALUE)s] = 1;
+                ''' % {
+                    'SV' : self._statevar,
+                    'VALUE' : value
+                })
+
+        if self.function == 'count':
+            code.append('''
+                # count()
+                %(SV)s[part,"count"]++;
+                ''' % {'SV' : self._statevar})
+        elif self.function == 'avg':
+            code.append('''
+                # avg()
+                %(SV)s[part,"count"]++;
+                %(SV)s[part,"sum"] += %(VALUE)s;
+                ''' % {
+                    'SV' : self._statevar,
+                    'VALUE' : value
+                })
+        elif self.function == 'max':
+            code.append('''
+                # max()
+                if (%(SV)s[part,"max"] == "") {
+                    %(SV)s[part,"max"] = %(VALUE)s;
+                } else if (%(VALUE)s > %(SV)s[part,"max"]) {
+                    %(SV)s[part,"max"] = %(VALUE)s;
+                }
+                ''' % {
+                    'SV' : self._statevar,
+                    'VALUE' : value
+                })
+        elif self.function == 'min':
+            code.append('''
+                # min()
+                if (%(SV)s[part,"min"] == "") {
+                    %(SV)s[part,"min"] = %(VALUE)s;
+                } else if (%(VALUE)s < %(SV)s[part,"min"]) {
+                    %(SV)s[part,"min"] = %(VALUE)s;
+                }
+                ''' % {
+                    'SV' : self._statevar,
+                    'VALUE' : value
+                })
+        elif self.function in ['sum', 'total']:
+            code.append('''
+                # sum() or total()
+                %(SV)s[part,"sum"] += %(VALUE)s;
+                ''' % {
+                    'SV' : self._statevar,
+                    'VALUE' : value
+                })
+        else:
+            raise NotImplementedError(self.function)
+
+        if self.distinct:
+            code.append('} # End distinct')
+
+        return '\n'.join(code)
+
+    def awk_final(self, schema):
+        """Returns awk code that evaluates the final value of the aggregate
+        function.
+
+        The code should reference the current partition using the `part`
+        variable.
+
+        """
+        if self.function == 'count':
+            # count() should return 0 if no rows were processed.
+            code = '(%(SV)s[part,"count"] != "") ? %(SV)s[part,"count"] : 0' \
+                % {'SV' : self._statevar}
+        elif self.function == 'avg':
+            code = '%(SV)s[part,"sum"] / %(SV)s[part,"count"]' % \
+                {'SV' : self._statevar}
+        elif self.function == 'max':
+            code = '%s[part,"max"]' % self._statevar
+        elif self.function == 'min':
+            code = '%s[part,"min"]' % self._statevar
+        elif self.function in ['sum', 'total']:
+            code = '%s[part,"sum"]' % self._statevar
+        else:
+            raise NotImplementedError(self.function)
+
+        return code
+
+    def datatype(self, schema):
+        """Returns the type. """
+        if self.function == 'count':
+            return 'int'
+
+        return self.arg.datatype(schema)
+
+
+class Function(object):
+
+    """Non-aggregate function. """
+
+    def __init__(self, tokens):
+        function = tokens[0].lower()
+        function_map = {
+            'lower' : 'tolower',
+            'upper' : 'toupper'
+        }
+        self.function = function_map.get(function, function)
+
+        self.args = tokens[1:]
+
+        self.aggregate = any(arg.aggregate for arg in self.args)
+
+    def awk(self, schema):
+        """Returns the equivalent awk expression. """
+        assert not self.aggregate
+
+        args = [arg.awk(schema) for arg in self.args]
+
+        if self.function in ['min', 'max'] and len(args) > 2:
+            # Nest function calls for more than two args.
+            code = '%s(%s)' % (self.function, ', '.join(args[:2]))
+            for arg in args[2:]:
+                code = '%s(%s, %s)' % (self.function, code, arg)
+
+            return code
+
+        return '%s(%s)' % (self.function, ', '.join(args))
+
+    def awk_update(self, schema):
+        """Returns awk code that updates the incremental state of the aggregate
+        argument(s).
+
+        """
+        assert self.aggregate
+
+        code = []
+        for arg in self.args:
+            if arg.aggregate:
+                code.append(arg.awk_update(schema))
+        return ' '.join(code)
+
+    def awk_final(self, schema):
+        """Returns awk code that evaluates the final value of the function. """
+        assert self.aggregate
+
+        args = []
+        for arg in self.args:
+            if arg.aggregate:
+                args.append(arg.awk_final(schema))
+            else:
+                args.append(arg.awk(schema))
+
+        return '%s(%s)' % (self.function, ', '.join(args))
+
+    def datatype(self, schema):
+        """Returns the type. """
+        if self.function in ['lower', 'upper', 'trim', 'ltrim', 'rtrim',
+                             'replace', 'substr', 'strftime', 'submatch',
+                             'mask_ip']:
+            return 'str'
+
+        if self.function in ['length', 'int']:
+            return 'int'
+
+        if self.function in ['abs', 'max', 'min']:
+            types = set(arg.datatype(schema) for arg in self.args)
+
+            if 'real' in types:
+                return 'real'
+
+            return 'int'
+
+        raise ValueError(self.function)
+
+
+class Projection(object):
+
+    """Column expression. """
+
+    def __init__(self, tokens):
+        self.expression = tokens[0]
+
+        self.alias = None
+        if len(tokens) > 1:
+            self.name = self.alias = tokens[2]
+        elif isinstance(self.expression, ColumnName):
+            self.name = self.expression.column
+        elif (isinstance(self.expression, Function) or
+              isinstance(self.expression, AggregateFunction)):
+            self.name = self.expression.function
+        else:
+            self.name = 'expr'
+
+        self.aggregate = self.expression.aggregate
+
+    def awk(self, schema):
+        """Returns the equivalent awk expression. """
+        assert not self.aggregate
+
+        return self.expression.awk(schema)
+
+    def awk_update(self, schema):
+        """Returns awk code that updates the incremental state of the aggregate
+        expression.
+
+        """
+        assert self.aggregate
+
+        return self.expression.awk_update(schema)
+
+    def awk_final(self, schema):
+        """Returns awk code that evaluates the final value of the aggregate
+        expression.
+
+        """
+        assert self.aggregate
+
+        return self.expression.awk_final(schema)
+
+    def datatype(self, schema):
+        """Returns the type. """
+        return self.expression.datatype(schema)
+
+
+class Where(object):
+
+    """Filter expression. """
+
+    def __init__(self, tokens):
+        self.expression = tokens[0]
+        self.aggregate = False
+
+    def awk(self, schema):
+        """Returns the equivalent awk expression. """
+        return self.expression.awk(schema)
+
+
+def grammar(gawk=False):
+    """Returns the SQL query statement grammar. """
+    lpar = Suppress('(')
+    rpar = Suppress(')')
+    star = Keyword('*')
+
+    def split_keywords(string):
+        """Returns a dictionary mapping the tokens in `string` to
+        CaselessKeyword objects.
+
+        """
+        return dict(((w, CaselessKeyword(w)) for w in string.split()))
+
+    functions = ('abs length lower upper trim ltrim rtrim max min replace '
+                 'substr int ip_in_cidr mask_ip')
+
+    if gawk:
+        # Define gawk-specific functions.
+        functions += ' strftime submatch'
+
+    functions = split_keywords(functions)
+    function_name = Or(functions.values())
+
+    aggregates = split_keywords('avg count max min sum total')
+    aggregate_function_name = Or(aggregates.values())
+
+    keywords = split_keywords('where as distinct and or like select limit')
+    keywords['not like'] = CaselessKeyword('not like')
+    keyword = Or(keywords.values())
+
+    identifier = ~keyword + Word(alphas, alphanums + '_')
+    column_name = identifier.copy().setParseAction(ColumnName)
+
+    all_columns = star.copy().setParseAction(ColumnName)
+
+    numeric_literal = Combine(
+        (Word(nums) + Optional('.' + Word(nums)) | '.' + Word(nums)) +
+        Optional('E' + Optional(oneOf('+ -')) + Word(nums))
+    ).setParseAction(NumericLiteral)
+    string_literal = (QuotedString("'") |
+                      QuotedString('"')).setParseAction(StringLiteral)
+    regex_literal = QuotedString('/').setParseAction(RegexLiteral)
+    literal_value = numeric_literal | string_literal | regex_literal
+
+    expr = Forward()
+
+    aggregate_function_arg = Optional(keywords['distinct']) + expr
+    count_function_arg = Optional(keywords['distinct']) + (expr | star)
+    aggregate_function = (aggregate_function_name + lpar +
+                          aggregate_function_arg + rpar | aggregates['count'] +
+                          lpar + count_function_arg +
+                          rpar).setParseAction(AggregateFunction)
+
+    function_arg = Optional(delimitedList(expr))
+    function = (function_name + lpar + Optional(function_arg) +
+                rpar).setParseAction(Function)
+
+    expr_term = (aggregate_function | function | literal_value | column_name |
+                 lpar + expr + rpar)
+    expr << operatorPrecedence(expr_term, [
+        ('^', 2, opAssoc.LEFT, BinaryExpression),
+        (oneOf('- + !'), 1, opAssoc.RIGHT, UnaryExpression),
+        ('||', 2, opAssoc.LEFT, BinaryExpression),
+        (oneOf('* / %'), 2, opAssoc.LEFT, BinaryExpression),
+        (oneOf('+ -'), 2, opAssoc.LEFT, BinaryExpression),
+        (oneOf('< <= > >='), 2, opAssoc.LEFT, BinaryExpression),
+        (oneOf('= == !='), 2, opAssoc.LEFT, BinaryExpression),
+        (oneOf('~ !~'), 2, opAssoc.LEFT, BinaryExpression),
+        (keywords['not like'], 2, opAssoc.LEFT, BinaryExpression),
+        (keywords['like'], 2, opAssoc.LEFT, BinaryExpression),
+        (keywords['and'], 2, opAssoc.LEFT, BinaryExpression),
+        (keywords['or'], 2, opAssoc.LEFT, BinaryExpression),
+    ])
+
+    projection = (all_columns | (expr + Optional(keywords['as'] +
+                                 identifier))).setParseAction(Projection)
+
+    where_expr = (keywords['where'] +
+                  expr.setResultsName('where').setParseAction(Where))
+
+    limit_expr = (keywords['limit'] + Word(nums).setResultsName('limit'))
+
+    projection_list = projection + ZeroOrMore(Suppress(',') + projection)
+
+    query_stmt = Optional(keywords['select']) + \
+                 Optional(keywords['distinct']).setResultsName('distinct') + \
+                 projection_list.setResultsName('projections') + \
+                 Optional(where_expr) + Optional(limit_expr)
+
+    return query_stmt
+
+
+class Query(object):
+
+    """Parsed query text.
+
+    Attributes:
+
+        where : a Where object or None
+        projections : a list of Projection objects or None if '*'
+        aggregate : True if an aggregate function is used, False otherwise
+        distinct: True if distinct is used, False otherwise
+        limit: integer row limit or None
+
+    """
+
+    def __init__(self, query, gawk=False):
+        self._gawk = gawk
+
+        query_stmt = grammar(gawk)
+
+        query = query.strip()
+        if not query or query[:5].lower() in ['where', 'limit']:
+            # Implicitly project all columns.
+            query = ('* ' + query).strip()
+
+        try:
+            parsed = query_stmt.parseString(query, parseAll=True).asDict()
+        except ParseException as err:
+            print
+            print query
+            print ' ' * err.loc + '^'
+            print err.msg
+            raise
+
+        self.distinct = 'distinct' in parsed
+        self.projections = parsed['projections']
+
+        self.aggregate = False
+
+        for projection in self.projections:
+            if projection.aggregate:
+                self.aggregate = True
+
+        if 'where' in parsed:
+            self.where = parsed['where']
+        else:
+            self.where = None
+
+        if 'limit' in parsed:
+            self.limit = int(parsed['limit'])
+            if self.limit <= 0:
+                raise ValueError('limit must be a positive integer')
+        else:
+            self.limit = None
+
+    def awk(self, schema):
+        """Returns the equivalent awk program as a string. """
+        code = []
+
+        code.append('''
+            # This program was generated by sqawk.
+
+            BEGIN {
+                FS = "\\t";
+                records = 0;
+            }
+
+            function abs(x) {
+                return (x >= 0) ? x : -x;
+            }
+
+            function ltrim(x, y) {
+                sub("^[" y "]+", "", x);
+                return x;
+            }
+
+            function rtrim(x, y) {
+                sub("[" y "]+$", "", x);
+                return x;
+            }
+
+            function trim(x, y) {
+                return rtrim(ltrim(x, y), y);
+            }
+
+            function max(x, y) {
+                return (x >= y) ? x : y;
+            }
+
+            function min(x, y) {
+                return (x <= y) ? x : y;
+            }
+
+            function replace(x, y, z) {
+                gsub(y, z, x);
+                return x;
+            }
+
+            # Returns a regular expression that is equivalent to a LIKE expression.
+            function like2regex(x,    head, tail) {
+                x = trim(x, "\\"");
+
+                if (substr(x, 1, 1) != "%") {
+                    head = "^";
+                } else {
+                    head = "";
+                    x = substr(x, 2);
+                }
+
+                if (substr(x, length(x), 1) != "%") {
+                    tail = "$";
+                } else {
+                    tail = "";
+                    x = substr(x, 1, length(x)-1);
+                }
+
+                gsub("%", ".*", x);
+
+                return head x tail;
+            }
+
+            # Converts an IP address in dotted quad format into a 32-character binary string.
+            function ip2bin(ip,    tokens, n, bin) {
+                split(ip, tokens, ".");
+                n = (tokens[1] * 2^24) + (tokens[2] * 2^16) + (tokens[3] * 2^8) + tokens[4];
+
+                while (n > 0) {
+                    bin = (n % 2) bin;
+                    n = int(n / 2);
+                }
+
+                while (length(bin) != 32) {
+                    bin = "0" bin;
+                }
+
+                return bin;
+            }
+
+            # Converts a 32-character binary string into a dotted quad.
+            function bin2ip(bin,    bits, len, i, dec, quad, ip) {
+                split(bin, bits, "");
+
+                for (i=32; i>0; i--) {
+                    dec += bits[i] * 2^(32-i);
+                }
+
+                for (i=3; i>=1; i--) {
+                    quad = 256^i;
+                    ip = ip int(dec/quad) ".";
+                    dec = dec % quad;
+                }
+
+                return ip dec;
+            }
+
+            # Returns 1 if `ip` (dotted quad format) is in the network described by `cidr`.
+            # Ex: ip_in_cidr("192.168.1.1", "192.168.0.0/16") => 1
+            function ip_in_cidr(ip, cidr,    tokens, maskbits, netip) {
+                ip = ip2bin(ip);
+                split(cidr, tokens, "/");
+                netip = ip2bin(tokens[1]);
+                maskbits = tokens[2];
+
+                if (substr(ip, 1, maskbits) == substr(netip, 1, maskbits)) {
+                    return 1;
+                } else {
+                    return 0;
+                }
+            }
+
+            # Returns a dotted quad with the specified number of bits zeroed.
+            # Ex: mask_ip("192.168.1.1", 16) => "192.168.0.0"
+            function mask_ip(ip, maskbits) {
+                ip = substr(ip2bin(ip), 1, maskbits);
+                for (i=0; i<32-maskbits; i++) {
+                    ip = ip "0";
+                }
+                return bin2ip(ip);
+            }
+            ''')
+
+        if self._gawk:
+            # Include gawk-specific functions.
+            code.append('''
+                # Returns the specified match group.
+                # Ex: submatch("foobar", "^(.{3})", 1) => foo"
+                function submatch(value, pattern, group,    subgroups) {
+                    if (match(value, pattern, subgroups) != 0) {
+                        return subgroups[group];
+                    }
+                    return "";
+                }
+                ''')
+
+        code.append('''
+            { # Program block.
+            ''')
+
+        if self.where:
+            # Filter records with an if statement.
+            code.append('if (%s) { # Filter.' % self.where.awk(schema))
+
+        if not self.aggregate:
+            # No aggregate projections.
+
+            # Evaluate and output all projections.
+            record = '"\\t"'.join(p.awk(schema) for p in self.projections)
+
+            code.append('record = %s;' % record)
+
+            if self.distinct:
+                # Only output a record if it hasn't been seen before.
+                code.append('''
+                    if (distinct[record] == "") { # Distinct check.
+                        distinct[record] = 1;
+                    ''')
+
+            code.append('print record;')
+
+            if self.limit:
+                code.append('''
+                    records++;
+                    if (records == %s) {
+                        # Limit reached.
+                        exit;
+                    }
+                    ''' % self.limit)
+
+            if self.distinct:
+                code.append('} # End distinct check.')
+        else:
+            # Evaluate aggregate projections.
+
+            aggregates = []
+            non_aggregates = []
+            for projection in self.projections:
+                if projection.aggregate:
+                    aggregates.append(projection)
+                else:
+                    non_aggregates.append(projection)
+
+            if non_aggregates:
+                # Partition on non-aggregate projections.
+                partition = '"\\t"'.join(p.awk(schema) for p in non_aggregates)
+            else:
+                # No partitions.
+                partition = '""'
+
+            # Set the partition and add it to the array of partitions.
+            code.append('''
+                part = %s;
+                partitions[part] = 1;
+                ''' % partition)
+
+            # Incrementally evaluate the aggregate projections.
+            for projection in aggregates:
+                code.append(projection.awk_update(schema))
+
+        if self.where:
+            # Close the filter if statement.
+            code.append('} # End filter.')
+
+        code.append('} # End program block.')
+
+        if self.aggregate:
+            # Output a record for each partition.
+            code.append('''
+                END {
+                    parts = 0;
+                    for (part in partitions) {
+                        parts++;
+                        break;
+                    }
+                    if (parts == 0) {
+                        # No rows passed the filter, but some aggregate
+                        # functions are valid on 0 rows.
+                        partitions[""] = 1;
+                    }
+
+                    for (part in partitions) {
+                        parts++;
+                        split(part, part_values, "\\t");
+                        ORS = "\\t";
+                ''')
+
+            i = 1
+            for j, projection in enumerate(self.projections):
+                if j == len(self.projections) - 1:
+                    # Last item.
+                    code.append('ORS = "\\n";')
+
+                if projection.aggregate:
+                    # Retrieve the final value for the projection.
+                    code.append('print %s;' % projection.awk_final(schema))
+                else:
+                    # For each non-aggregate projection, project the partition
+                    # value of that column.
+                    code.append('print part_values[%d];' % i)
+                    i += 1
+
+            if self.limit:
+                code.append('''
+                    records++;
+                    if (records == %s) {
+                        # Limit reached.
+                        exit;
+                    }
+                    ''' % self.limit)
+
+            code.append('''
+                    } # End partitions loop.
+                } # End END.
+                ''')
+
+        return '\n'.join(code)
+
+
+def awk_is_gawk(awk):
+    """Returns True if the awk that will be used is gawk. """
+    if not awk:
+        awk = distutils.spawn.find_executable('awk')
+
+    return os.path.basename(os.path.realpath(awk)) == 'gawk'
+
+
+def main():
+    """Parses args and executes. """
+    parser = argparse.ArgumentParser()
+    parser.add_argument('query', nargs=1, help='SQL query')
+    parser.add_argument('-D', '--debug', action='store_true', default=False,
+                        help='write the awk program to stdout and exit')
+    parser.add_argument('-a', '--awk', help='the awk interpreter to use')
+    parser.add_argument('-g', '--gawk', action='store_true', default=False,
+                        help='enable gawk-specific functionality')
+    args = parser.parse_args()
+
+    if not args.gawk and awk_is_gawk(args.awk):
+        # Enable gawk-specific functionality if we're running gawk.
+        args.gawk = True
+
+    query = Query(args.query[0], args.gawk)
+
+    header = db.read_header()
+    schema = db.parse_header(header)
+
+    code = query.awk(schema)
+
+    if args.debug:
+        print code
+        return
+
+    # Determine the output schema.
+    output_schema = {}
+
+    def output_schema_add(name, index, datatype):
+        """Adds a column to the output schema. """
+        if name in output_schema:
+            raise ValueError('duplicate output column name "%s"' % name)
+
+        output_schema[name] = [index, datatype]
+
+    i = 0
+    for projection in query.projections:
+        name = projection.name
+        if name == '*':
+            items = schema.items()
+            items.sort(key=lambda i: i[1][0])
+            for name, (_, datatype) in items:
+                output_schema_add(name, i, datatype)
+                i += 1
+        else:
+            datatype = projection.datatype(schema)
+            output_schema_add(name, i, datatype)
+            i += 1
+
+    header = db.make_header(output_schema)
+    print header
+    sys.stdout.flush()
+
+    if not args.awk:
+        # Use the default awk.
+        os.execlp('awk', 'awk', code)
+    else:
+        # Use the specified awk.
+        os.execl(args.awk, 'awk', code)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

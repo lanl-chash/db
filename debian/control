@@ -1,0 +1,12 @@
+Source: db
+Section: misc
+Priority: extra
+Maintainer: Curt Hash <chash@lanl.gov>
+Build-Depends: debhelper (>= 8.0.0), libpcap-dev
+X-Python-Version: >= 2.7
+Standards-Version: 3.9.4
+
+Package: db
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, python (>= 2.7), python-dateutil, python-pyparsing, libpcap-dev, sqlite3, nodejs, python-configobj, python-flufl.lock
+Description: TSV and JSON data utilities.

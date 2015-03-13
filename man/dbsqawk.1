@@ -1,0 +1,382 @@
+.TH DBSQAWK 1 "September 2014" "db Manual" "db Manual"
+
+.SH NAME
+dbsqawk \- Query db data using SQL compiled to awk
+
+.SH SYNOPSIS
+\fBdbsqawk\fR [\fIOPTION\fR]... [\fIQUERY\fR]
+
+.SH SUMMARY
+\fBdbsqawk\fR translates a SQL query into an awk program and executes it on db
+records that are read from stdin. The query result, which is itself db records
+(possibly with a different schema), is written to stdout.
+
+.SH DESCRIPTION
+\fBdbsqawk\fR understands a query language resembling SQL. It is intended to
+allow users to filter and manipulate db data using a familiar syntax.
+
+.SS Queries
+.PP
+A \fIquery\fP consists of a list of projections (i.e., output columns) coupled
+with an optional boolean filter expression. The format for a \fIquery\fP is:
+.RS
+.PP
+[[\fBselect\fR] [\fBdistinct\fR] \fIprojection\fP[, \fIprojection\fP]] [\fBwhere\fR \fIexpression\fP] [\fBlimit\fR \fIinteger\fP]
+.RE
+.PP
+The \fBselect\fR keyword is optional. The \fBdistinct\fR keyword may be used to
+eliminate duplicate output records. If the query begins with either the
+\fBwhere\fR or \fBlimit\fR keyword, all columns are implicitly projected. The
+\fBlimit\fR keyword may be used to limit the number of output records.
+.PP
+A \fIprojection\fP is either \(lq*\(rq (project all columns) or an \fIexpression\fP.
+.PP
+An \fIexpression\fP is either an \fIaggregate-function-call\fP,
+\fIfunction-call\fP, literal value or a column reference.
+.PP
+Expressions may be combined into complex expressions using the following
+operators in decreasing order of precedence:
+.RS
+.PP
+.PD 0
+.TP
+.B ( \fIexpression\fP )
+Returns the value of \fIexpression\fP. This may be used to override the normal
+precedence of operators.
+.TP
+.B ^
+Exponentiation.
+.TP
+.B - + !
+Unary plus, minus and logical negation.
+.TP
+.B ||
+String concatenation.
+.TP
+.B * / %
+Multiplication, division and modulus.
+.TP
+.B + -
+Addition and subtraction.
+.TP
+.B < <= > >=
+Relational.
+.TP
+.B = == !=
+Equality.
+.TP
+.B ~ !~
+Matching and non-matching. The right operand must be a regular expression. See
+the section about regular expressions below.
+.TP
+.B not like
+Not like \fIpattern\fP. The right operand must be an expression that evaluates
+to a string containing 1 or more \(lq%\(rq characters as wildcards.
+.TP
+.B like
+Like \fIpattern\fP. The right operand must be an expression that evaluates to a
+string containing 1 or more \(lq%\(rq characters as wildcards.
+.TP
+.B and
+Logical and.
+.TP
+.B or
+Logical or.
+.PD
+.RE
+.PP
+Expressions may be aliased. If not aliased, \fBdbsqawk\fR will choose a column
+name (often just \(lqexpr\(rq). Note that \fBdbsqawk\fR does not allow
+duplicate output column names, because the output would not be valid db data.
+As such, aliasing is often necessary. The format for an \fIalias\fR is:
+.RS
+.PP
+\fIexpression\fP [\fBas\fR \fIalias-name\fP]
+.RE
+.PP
+An \fIaggregate-function-call\fP is a function that computes a single result
+over multiple input records (e.g., \fBsum()\fR). Input records are implicitly
+grouped by the values of any non-aggregate projections. The format for an
+\fIaggregate-function-call\fP is:
+.RS
+.PP
+\fIfunc-name\fP([\fBdistinct\fR] \fIexpression\fP)
+.RE
+.PP
+The \fBdistinct\fR keyword may be used within an aggregate function to limit
+the function to distinct values of the \fIexpression\fP.
+.PP
+Normal (non-aggregate) functions may take 0 or more expressions as arguments.
+The format for a \fIfunction-call\fP is:
+.RS
+.PP
+\fIfunc-name\fP(\fIexpression\fP[, \fIexpression\fP])
+.RE
+
+.SS Aggregate Functions
+.PP
+Aggregate functions operate on groups of input records. Input records are
+partitioned into groups according to the combined values of the non-aggregate
+projections in a query. If a query contains no non-aggregate projections, the
+entire input is a single group.
+.PP
+The following is a list of aggregate functions that \fBdbsqawk\fR supports with
+their description and usage.
+.RS
+.PP
+.PD 0
+.TP
+.B avg(\fIexpression\fP)
+Returns the average of \fIexpression\fP within a group.
+.TP
+.B count(\fIexpression\fP), count(*)
+Returns the total number of records in a group.
+.TP
+.B max(\fIexpression\fP)
+Returns the maximum value of \fIexpression\fP within a group.
+.TP
+.B min(\fIexpression\fP)
+Returns the minimum value of \fIexpression\fP within a group.
+.TP
+.B sum(\fIexpression\fP), total(\fIexpression\fP)
+Returns the sum of \fIexpression\fP within a group.
+.PD
+.RE
+
+.SS Functions
+.PP
+The following is a list of non-aggregate functions that \fBdbsqawk\fR supports
+with their description and usage. Some \fBdbsqawk\fR functions require gawk
+extensions that are not available in traditional awk. These functions are
+labeled \fBGAWK ONLY\fR.
+.RS
+.PP
+.PD 0
+.TP
+.B abs(\fInumber\fP)
+Returns the absolute value of \fInumber\fP.
+.TP
+.B length(\fIstring\fP)
+Returns the length of \fIstring\fP.
+.TP
+.B lower(\fIstring\fP)
+Returns \fIstring\fP converted to lowercase.
+.TP
+.B upper(\fIstring\fP)
+Returns \fIstring\fP converted to uppercase.
+.TP
+.B trim(\fIstring\fP)
+Returns \fIstring\fP with whitespace characters removed from both the left and
+right.
+.TP
+.B ltrim(\fIstring\fP)
+Returns \fIstring\fP with whitespace characters removed from the left only.
+.TP
+.B rtrim(\fIstring\fP)
+Returns \fIstring\fP with whitespace characters removed from the right only.
+.TP
+.B max(\fIexpression1\fP, \fIexpression2\fP, ...)
+Returns the maximum value of the expressions.
+.TP
+.B min(\fIexpression1\fP, \fIexpression2\fP, ...)
+Returns the minimum value of the expressions.
+.TP
+.B replace(\fIstring\fP, \fIdynamic-regular-expression\fP, \fIreplacement\fP)
+Replaces all of the longest, leftmost, non-overlapping substrings of
+\fIstring\fP matching \fIdynamic-regular-expression\fP with \fIreplacement\fP.
+.TP
+.B substr(\fIstring\fP, \fIstart\fP[, \fIlength\fP])
+Returns the \fIlength\fP-character substring of \fIstring\fP, starting at
+character number \fIstart\fP. If \fIlength\fP is omitted, the whole suffix of
+\fIstring\fP that begins at character number \fIstart\fP is returned.
+.TP
+.B int(\fInumber\fP)
+Returns \fInumber\fP truncated to the nearest integer.
+.TP
+.B ip_in_cidr(\fIip\fP, \fIcidr\fP)
+Returns 1 if \fIip\fP (a dotted-quad string) is in the network described by
+\fIcidr\fP, 0 otherwise.
+.TP
+.B mask_ip(\fIip\fP, \fIbits\fP)
+Returns a dotted-quad string with the last \fIbits\fP bits of \fIip\fP (a
+dotted-quad string) set to 0.
+.TP
+.B strftime([\fIformat\fP[, \fItimestamp\fP[, \fIutc-flag\fP]]])
+\fBGAWK ONLY\fR. Returns the epoch \fItimestamp\fP formatted according to the
+\fIformat\fP string. See the corresponding function in gawk(1).
+.TP
+.B submatch(\fIstring\fP, \fIdynamic-regular-expression\fP, \fIgroup-number\fP)
+\fBGAWK ONLY\fR. Returns the substring of \fIstring\fP matched by the
+\fIgroup-number\fP-th parenthesized group of \fIdynamic-regular-expression\fP.
+Group number 0 indicates the entire matched string, number 1 is the leftmost
+parenthesized group and so on.  See the explanation of the \fBmatch()\fR
+function in gawk(1).
+.PD
+.RE
+
+.SS Regular Expressions
+.PP
+There are two types of regular expressions in awk: constant and dynamic. A
+constant regular expression is enclosed in slashes (e.g.,
+/\fIregular-expression\fP/). A dynamic regular expression is any string-valued
+\fIexpression\fP (including a string literal) that is used as a regular
+expression. The most important difference between the two types is that
+\fBdynamic regular expressions must be double escaped\fR.
+.PP
+Constant regular expressions can be used with the \fB~\fR and \fB!~\fR match
+operators; however, they cannot be used as arguments to functions such as
+\fBreplace()\fR and \fBsubmatch()\fR. Why? Because function arguments are
+evaluated prior to executing the function. For constant regular expressions,
+this means they are matched against $0 (the entire input record) and the return
+value of that match (an integer boolean value) is what gets passed to the
+function. \fBAlways use dynamic regular expressions when it is necessary to
+pass a regular expression to a function.\fR
+.PP
+For a description of regular expression syntax, consult the man page of the awk
+variant that is being used.
+
+.SH ARGUMENTS
+.TP
+\fBQUERY\fR
+Parse and execute the specified \fIQUERY\fR.
+
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Output usage and exit.
+.TP
+\fB\-D\fR, \fB\-\-debug\fR
+Translate \fIQUERY\fR to awk and write the awk source code to stdout. Do not
+execute.
+.TP
+\fB\-a\fR, \fB\-\-awk\fR \fIPATH\fR
+Use the awk interpreter at \fIPATH\fR.
+.TP
+\fB\-g\fR, \fB\-\-gawk\fR
+Enable gawk-specific functionality. This is done automatically if gawk is
+detected.
+
+.SH EXAMPLES
+.B dbsqawk 'limit 10'
+
+Output the first 10 records.
+
+.P
+.B dbsqawk 'where ip = \(dq192.168.1.1\(dq limit 10'
+.br
+.B dbsqawk '* where ip = \(dq192.168.1.1\(dq limit 10'
+.br
+.B dbsqawk 'select * where ip = \(dq192.168.1.1\(dq limit 10'
+
+Output the first 10 records where the \fBip\fR column is equal to
+\(lq192.168.1.1\(rq.
+
+.P
+.B dbsqawk 'ip'
+
+Output the \fBip\fR column value from all records.
+
+.P
+.B dbsqawk 'distinct ip'
+
+Output all distinct values of the \fBip\fR column in the order in which they
+are read.
+
+.P
+.B dbsqawk 'ip, count(*)'
+.br
+.B dbsqawk 'ip, count(ip)'
+
+For each distinct value of the \fBip\fR column, output the value and the number
+of records with that value.
+
+.P
+.B dbsqawk 'ip, max(bytes)'
+
+For each distinct value of the \fBip\fR column, output the value and the
+maximum value of the \fBbytes\fR column in records with that value.
+
+.P
+.B dbsqawk 'where max(src_bytes, dst_bytes) > 0'
+.br
+.B dbsqawk 'where src_bytes > 0 or dst_bytes > 0'
+.br
+.B dbsqawk 'where ((src_bytes > 0) or (dst_bytes > 0))'
+
+Output records where the either the \fBsrc_bytes\fR or \fBdst_bytes\fR column
+value is greater than zero.
+
+.P
+.B dbsqawk 'src_bytes + dst_bytes as all_bytes'
+
+Output the sum of the \fBsrc_bytes\fR and \fBdst_bytes\fR column values as a
+new column named \(lqall_bytes\(rq.
+
+.P
+.B dbsqawk 'count(distinct ip)'
+
+Output the number of distinct values of the \fBip\fR column.
+
+.P
+.B dbsqawk 'ip, count(distinct *)'
+
+For each distinct value of the \fBip\fR column, output the value and the number
+of distinct records with that value.
+
+.P
+.B dbsqawk '\(dqhttp://\(dq || url as url'
+
+Prepend \(lqhttp://\(rq to every value of the \fBurl\fR column and output the
+new value.
+
+.P
+.B dbsqawk 'max(max(src_bytes), max(dst_bytes))'
+
+Output the maximum of the maximum values of the \fBsrc_bytes\fR and
+\fBdst_bytes\fR columns across all records.
+
+.P
+.B dbsqawk 'distinct ip where ip ~ /^192\\\\.168.+\\\\.5$/'
+.br
+.B dbsqawk 'distinct ip where ip ~ \(dq^192\\\\\\\\.168.+\\\\\\\\.5$\(dq'
+
+Output all distinct values of the \fBip\fR column where the value begins with
+\(lq192.168\(rq and ends with \(lq.5\(rq. Note the double escaping in the
+dynamic regular expression (bottom example) versus the single escaping in the
+constant regular expression (top example).
+
+.P
+.B dbsqawk 'replace(ip, \(dq^[0-9]{1,3}\\\\\\\\.[0-9]{1,3}\\\\\\\\.\(dq, \(dq0.0.\(dq) as ip'
+
+Replace the first two octets of the \fBip\fR column value with 0 and output the
+new value.
+
+.P
+.B dbsqawk 'where ip_in_cidr(ip, \(dq192.168.0.0/16\(dq)'
+.br
+.B dbsqawk 'where mask_ip(ip, 16) = \(dq192.168.0.0\(dq'
+
+Returns all records where the \fBip\fR column value is in the 192.168.0.0/16
+network.
+
+.P
+.B dbsqawk 'strftime("%Y-%m-%d %H:%M:%S%z", epoch) as timestamp'
+
+Outputs a column named \fBtimestamp\fR containing the values of the \fBepoch\fR
+column converted to timestamps like \(lq2014-09-24 18:41:00-0600\(rq.
+
+.P
+.B dbsqawk 'where submatch(sip, \(dq^(([0-9]+\\\\\\\\.){3})[0-9]+$\(dq, 1) != submatch(dip, \(dq^(([0-9]+\\\\\\\\.){3})[0-9]+$\(dq, 1)'
+.br
+.B dbsqawk 'where mask_ip(sip, 24) != mask_ip(dip, 24)'
+
+Outputs all records where the values of the \fBsip\fR and \fBdip\fR columns
+(which are IP addresses in dotted-quad format) are not on the same /24 network.
+For clarity, the calls to the \fBsubmatch()\fR function are returning the
+portion of the value matched by \(lq([0-9]+\\\\.){3}\(rq (i.e., group 1).
+
+.SH SEE ALSO
+awk(1), gawk(1), jsonsql(1)
+
+.SH AUTHOR
+Written by Curt Hash and Mike Fisk.

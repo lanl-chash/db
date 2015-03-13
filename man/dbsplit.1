@@ -1,0 +1,76 @@
+.TH DBSPLIT 1 "November 2014" "db Manual" "db Manual"
+
+.SH NAME
+dbsplit \- Split a db record stream into multiple output files
+
+.SH SYNOPSIS
+<data> | \fBdbsplit\fR [\fIOPTION\fR]... [\fIPATH\fR x N]
+
+.SH SUMMARY
+\fBdbsplit\fR splits or partitions input data records read from stdin into
+multiple output files.
+
+.SH ARGUMENTS
+.TP
+\fBPATH\fR
+Specify the path of each output file manually. This is only valid if the
+\fB\-u\fR (\fB\-\-uniq\fR) option is not set.
+
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Output usage and exit.
+.TP
+\fB\-n\fR, \fB\-\-parts\fR \fIN\fR
+Generate \fIN\fR output files.
+.TP
+\fB\-k\fR, \fB\-\-key\fR \fICOLNAME[,COLNAME]...\fR
+Specify a list of columns to partition on. The values of the columns will be
+hashed and mapped to an output file.
+.TP
+\fB\-s\fR, \fB\-\-set\fR
+Treat the columns specified with \fB\-\-key\fR as a set (i.e., unordered). In
+other words, the same set of column values will map to the same output file,
+regardless of order.
+.TP
+\fB\-p\fR, \fB\-\-prefix\fR \fIPREFIX\fR
+Output file names will be prefixed with \fIPREFIX\fR. This option is ignored if
+the output file paths are supplied as arguments.
+.TP
+\fB\-u\fR, \fB\-\-uniq\fR
+Each unique record or list/set of column values will be mapped to a unique
+output file. This option is incompatible with the \fB\-n\fR (\fB\-\-parts\fR)
+option, because the number of output files is determined by the number of
+unique values in the input data.
+
+.SH EXAMPLES
+.P
+.B dbsplit -n 10
+
+Round-robin split the input data stream into 10 output files.
+
+.P
+.B dbsplit -k sip,dip -n 10
+
+Partition the input data into 10 output files such that all records with the
+same values for the \(lqsip\(rq and \(lqdip\(rq columns are written to the same
+output file.
+
+.P
+.B dbsplit -k sip,dip -n 10 -s
+
+Partition the input data into 10 output files such that all records with the
+same \fBset\fR of values for the \(lqsip\(rq and \(lqdip\(rq columns are
+written to the same output file.
+
+.P
+.B dbsplit -k sip -u
+
+Split the input data into output files such that each unique value of
+\(lqsip\(rq is in its own output file.
+
+.SH SEE ALSO
+jsonsplit(1)
+
+.SH AUTHOR
+Written by Curt Hash.

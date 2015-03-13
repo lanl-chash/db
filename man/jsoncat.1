@@ -1,0 +1,46 @@
+.TH JSONCAT 1 "November 2014" "db Manual" "db Manual"
+
+.SH NAME
+jsoncat \- Print JSON records to stdout
+
+.SH SYNOPSIS
+\fBjsoncat\fR [\fIOPTION\fR]... \fIPATH\fR [\fIPATH\fR]...
+.br
+<file list> | \fBjsoncat\fR [\fIOPTION\fR]...
+
+.SH SUMMARY
+\fBjsoncat\fR takes a list of data files as arguments or from stdin and outputs
+their contents to stdout. Input data files can be uncompressed, gzip compressed
+data, bzip2 compressed data or 7-zip archive data.
+
+.SH ARGUMENTS
+.TP
+\fBPATH\fR
+Specify the path of a file to cat.
+
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Output usage and exit.
+.TP
+\fB\-m\fR, \fB\-\-mux\fR
+By default, the input data records are read from the input files in the order
+specified. If this option is set, \fBjsoncat\fR will multiplex the inputs,
+which can be faster; however, the order of the records will be altered.
+
+.SH EXAMPLES
+.P
+.B jsoncat foo.gz bar.bz2
+
+Uncompress and concatenate the contents of \(lqfoo.gz\(rq and \(lqbar.bz2\(rq.
+
+.P
+.B echo -e \(dqfoo.gz\\\\nbar.gz\(dq | jsoncat -m
+
+Uncompress and multiplex the contents of \(lqfoo.gz\(rq and \(lqbar.gz\(rq.
+
+.SH SEE ALSO
+dbcat(1)
+
+.SH AUTHOR
+Written by Curt Hash.

@@ -1,0 +1,42 @@
+.TH DB2SQLITE 1 "November 2014" "db Manual" "db Manual"
+
+.SH NAME
+db2sqlite \- Import db records into an sqlite database
+
+.SH SYNOPSIS
+<data> | \fBdb2sqlite\fR [\fIOPTION\fR]... \fIPATH\fR
+
+.SH SUMMARY
+\fBdb2sqlite\fR imports db records read from stdin into an sqlite database with
+a single table. The table schema is derived from the #db header.
+
+.SH ARGUMENTS
+.TP
+\fBPATH\fR
+Specify the path of the output database.
+
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Output usage and exit.
+.TP
+\fB\-t\fR, \fB\-\-table\fR \fINAME\fR
+Specify the name of the table to be created. The default table name is
+\(lqdb\(rq.
+.TP
+\fB\-f\fR, \fB\-\-fast\fR
+Use sqlite's bulk .import command. \fBDo not use this option if the data
+contains quotes!\fR
+
+.SH EXAMPLE
+.P
+.B db2sqlite -t mytable -f data.s3
+
+Import db records from stdin into a table called \(lqmytable\(rq in the sqlite
+database \(lqdata.s3\(rq.
+
+.SH SEE ALSO
+db2json(1)
+
+.SH AUTHOR
+Written by Curt Hash.

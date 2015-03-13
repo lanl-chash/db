@@ -1,0 +1,223 @@
+#!/usr/bin/env nodejs
+// vim: ts=2 et sw=2 sts=2 syntax=javascript
+
+/**
+ * jsonsort
+ *
+ * Copyright (c) 2015, Los Alamos National Security, LLC
+ * All rights reserved.
+ *
+ * Copyright (2015). Los Alamos National Security, LLC. This software was
+ * produced under U.S. Government contract DE-AC52-06NA25396 for Los Alamos
+ * National Laboratory (LANL), which is operated by Los Alamos National
+ * Security, LLC for the U.S. Department of Energy. The U.S. Government has
+ * rights to use, reproduce, and distribute this software. NEITHER THE
+ * GOVERNMENT NOR LOS ALAMOS NATIONAL SECURITY, LLC MAKES ANY WARRANTY, EXPRESS
+ * OR IMPLIED, OR ASSUMES ANY LIABILITY FOR THE USE OF THIS SOFTWARE. If
+ * software is modified to produce derivative works, such modified software
+ * should be clearly marked, so as not to confuse it with the version available
+ * from LANL.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ * Sorts JSON records using *nix sort.
+ *
+ * Key components are defined using JSONPath expressions. If no key is
+ * specified, the entire record is used as the sort key. As records are read,
+ * the sort keys are prepended to the input line using the internal delimiter
+ * and then piped to sort. The sorted output is piped to awk to remove the sort
+ * keys and output the original JSON records in sorted order.
+ *
+ * Author: Curt Hash <chash@lanl.gov>
+ */
+
+var cp = require('child_process');
+var fs = require('fs');
+var jsonpath = require('JSONPath');
+var readline = require('readline');
+
+var opt = require('optimist')
+  .usage('Usage: $0 [OPTION]...')
+  .alias('k', 'key')
+  .describe('k', 'sort key in JSONPATH[+OPTIONS] format')
+  .alias('d', 'delimiter')
+  .describe('d', 'internal delimiter (must not appear in the data)')
+  .default('d', '|')
+  .alias('f', 'files-from')
+  .describe('f', 'read input file paths from PATH')
+  .alias('h', 'help')
+  .describe('h', 'output this text and exit')
+  .boolean('h');
+
+var argv = opt.argv;
+
+if (argv.h) {
+  console.log(opt.help());
+  process.exit();
+}
+
+var key_exprs = [];
+var key_args = [];
+
+// Build a list of -k arguments for sort.
+if (argv.k) {
+  if (!Array.isArray(argv.k)) {
+    argv.k = [argv.k];
+  }
+
+  for (var i=0; i<argv.k.length; i++) {
+    // Keys are specified in JSONPATH+OPTIONS format. The +OPTIONS is used to
+    // specify sort options like -n and is optional. For example, "$.srcport+n"
+    // would mean sort numerically by srcport.
+    var tokens = argv.k[i].split('+');
+    if (tokens.length > 2) {
+      process.stderr.write('invalid sort key: ' + argv.k[i] + '\n');
+      process.exit(1);
+    }
+
+    key_exprs.push(tokens[0]);
+
+    // Add an argument e.g. "-k 1,1".
+    var args = ['-k', i+1 + ',' + (i+1).toString()];
+
+    if (tokens.length == 2) {
+      // Append the option(s) to form e.g. "-k 1,1n".
+      args[1] += tokens[1];
+    }
+
+    key_args = key_args.concat(args);
+  }
+}
+
+// Positional arguments that don't look like sort options must be sort targets.
+var targets = [];
+while (argv._.length && argv._[0][0] != "-") {
+  targets.push(argv._.shift());
+}
+
+var sort_args = ['-t' + argv.d, '-s'].concat(key_args).concat(argv._);
+var sort = cp.spawn('sort', sort_args);
+var awk = cp.spawn('awk', ['-F' + argv.d, '{print $NF}'])
+
+sort.stdout.pipe(awk.stdin);
+sort.stderr.pipe(process.stderr);
+
+sort.on('close', function(code) {
+  if (code != 0) {
+    process.stderr.write('sort exited with status ' + code);
+  }
+  awk.stdin.end();
+});
+
+awk.stdout.pipe(process.stdout);
+awk.stderr.pipe(process.stderr);
+
+awk.on('close', function(code) {
+  if (code != 0) {
+    process.stderr.write('awk exited with status ' + code);
+  }
+});
+
+if (argv.f) {
+  var input;
+  if (argv.f === true) {
+    // Read targets from stdin.
+    input = process.stdin;
+  } else {
+    // Read targets from a file.
+    input = fs.createReadStream(argv.f);
+  }
+
+  readline.createInterface({
+    input: input,
+    output: process.stdout,
+    terminal: false
+  }).on('line', function(line) {
+    targets.push(line);
+  }).on('close', function() {
+    process_streams();
+  });
+} else {
+  if (!targets.length) {
+    targets.push('-');
+  }
+  process_streams();
+}
+
+// Reads records from the stream and writes the sort key(s) and the records to
+// the sort child process. When the stream is exhausted, this function calls
+// process_streams() to process the next stream.
+function process_stream(stream) {
+  readline.createInterface({
+    input: stream,
+    output: process.stdout,
+    terminal: false
+  }).on('line', function(line) {
+    var obj = JSON.parse(line);
+
+    var key = [];
+
+    for (var i=0; i<key_exprs.length; i++) {
+      key.push(JSON.stringify(jsonpath.eval(obj, key_exprs[i])));
+    }
+
+    key = key.join(argv.d);
+
+    sort.stdin.write(key + argv.d + line + '\n');
+  }).on('close', function() {
+    process_streams();
+  });
+}
+
+// Shifts a stream from the targets list and begins processing it.
+function process_streams() {
+  if (targets.length) {
+    var input = targets.shift();
+    if (input == '-') {
+      process_stream(process.stdin);
+    } else {
+      var file = cp.exec("file -b '" + input + "' | awk -F, '{print $1}'",
+        function(error, stdout, stderr) {
+          var stream;
+          switch (stdout.trim()) {
+            case 'ASCII text':
+              stream = fs.createReadStream(input);
+              break;
+            case 'gzip compressed data':
+              stream = cp.spawn('zcat', [input]).stdout;
+              break;
+            case 'bzip2 compressed data':
+              stream = cp.spawn('bzcat', [input]).stdout;
+              break;
+            case '7-zip archive data':
+              stream = cp.spawn('7z', ['x', input, '-so']).stdout;
+              break;
+            default:
+              process.stderr.write('unsupported file type "' + stdout.trim() +
+                                   '" for "' + input + '"\n');
+              process.exit(1);
+          }
+
+          process_stream(stream);
+        });
+    }
+  } else {
+    sort.stdin.end();
+  }
+}

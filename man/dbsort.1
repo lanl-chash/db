@@ -1,0 +1,89 @@
+.TH DBSORT 1 "September 2014" "db Manual" "db Manual"
+
+.SH NAME
+dbsort \- Sort db records using *nix sort
+
+.SH SYNOPSIS
+\fBdbsort\fR [\fIOPTION\fR]... --files-from \fIPATH\fR -- [\fISORT_ARGS\fR]
+.br
+\fBdbsort\fR [\fIOPTION\fR]... -- \fIPATH\fR [\fIPATH\fR]... [\fISORT_ARGS\fR]
+.br
+\fBdbsort\fR [\fIOPTION\fR]... -- [\fISORT_ARGS\fR]
+
+.SH SUMMARY
+\fBdbsort\fR uses *nix sort to sort db data records. Input data files can be
+read from a file, provided as arguments or db data records can be piped
+directly to stdin. Input data files can be uncompressed, gzip compressed data,
+bzip2 compressed data or 7-zip archive data. Sorted db data records are written
+to stdout.
+
+.SH ARGUMENTS
+.TP
+\fBSORT_ARGS\fR
+Additional options to sort. For example, \fB--parallel\fR=\fIINTEGER\fR. See
+sort(1).
+.TP
+\fBPATH\fR
+Specify the path of a file to sort. Note that files specified on the command
+line must follow the double dash (--) like \fBSORT_ARGS\fR.
+
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Output usage and exit.
+.TP
+\fB\-k\fR, \fB\-\-key\fR \fICOLNAME[+[OPTIONS]]\fR
+Sort by \fICOLNAME\fR. Additional column sort \fIOPTIONS\fR (e.g., \(lqr\(rq
+for reverse) can be specified using a plus followed by the option letter(s).
+There is no need to specify numeric sort options like \(lqg\(rq and \(lqn\(rq;
+these options are added automatically based on the column type. This option can
+be used multiple times to sort by multiple columns. See sort(1).
+.TP
+\fB\-\-files-from\fR \fIPATH\fR
+Read a list of input files from \fIPATH\fR. If \fIPATH\fR is equal to
+\(lq-\(rq, the list of input files will be read from stdin.
+
+.SH EXAMPLES
+.P
+.B dbsort
+
+Read records from stdin and sort them.
+
+.P
+.B echo -e \(dqfoo.gz\\\\nbar.gz\(dq | dbsort --files-from -
+.br
+.B dbsort -- foo.gz bar.gz
+
+Uncompress and sort the contents of \(lqfoo.gz\(rq and \(lqbar.gz\(rq.
+
+.P
+.B dbsort --files-from sort_files.txt
+
+Sort the contents of the files listed in \(lqsort_files.txt\(rq.
+
+.P
+.B dbsort -k ip
+
+Sort records by the \fBip\fR column.
+
+.P
+.B dbsort -k ip+r
+
+Sort records by the \fBip\fR column in reverse order.
+
+.P
+.B dbsort -k sip -k dip
+
+Sort records by the \fBsip\fR and \fBdip\fR columns.
+
+.P
+.B dbsort -k ip -- -s --parallel=48 -S48G
+
+Sort records by the \fBip\fR column. Additionally, stabilize the sort, run 48
+sorts concurrently and use up to 48 gigabytes of main memory.
+
+.SH SEE ALSO
+sort(1), jsonsort(1)
+
+.SH AUTHOR
+Written by Curt Hash.

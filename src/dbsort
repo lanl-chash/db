@@ -1,0 +1,249 @@
+#!/bin/bash
+#
+# Copyright (c) 2015, Los Alamos National Security, LLC
+# All rights reserved.
+#
+# Copyright (2015). Los Alamos National Security, LLC. This software was
+# produced under U.S. Government contract DE-AC52-06NA25396 for Los Alamos
+# National Laboratory (LANL), which is operated by Los Alamos National
+# Security, LLC for the U.S. Department of Energy. The U.S. Government has
+# rights to use, reproduce, and distribute this software. NEITHER THE
+# GOVERNMENT NOR LOS ALAMOS NATIONAL SECURITY, LLC MAKES ANY WARRANTY, EXPRESS
+# OR IMPLIED, OR ASSUMES ANY LIABILITY FOR THE USE OF THIS SOFTWARE. If
+# software is modified to produce derivative works, such modified software
+# should be clearly marked, so as not to confuse it with the version available
+# from LANL.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# A wrapper around sort for sorting db data records.
+#
+# Author: Curt Hash <chash@lanl.gov>
+
+set -e
+
+function usage {
+	cat <<EOF
+Usage: $0 [OPTIONS] --files-from=[PATH] -- [SORT ARGS]
+       $0 [OPTIONS] -- [FILE]... [SORT ARGS]
+       <data> | $0 [OPTIONS] -- [SORT ARGS]
+
+Options:
+  -h|--help			output this text and exit
+  -k|--key COLNAME[+[OPTIONS]]	sort column and options
+  --files-from=PATH		read sort targets from file (- for stdin)
+EOF
+	exit 0
+}
+
+OPTS="hk:"
+LONG="help,key:,files-from:"
+ARGS=$(getopt -o $OPTS -l $LONG -- "$@")
+eval set -- "$ARGS"
+
+KEYS=()
+
+while :
+do
+	case "$1" in
+		-h|--help)
+			usage
+			;;
+		-k|--key)
+			KEYS+=("$2")
+			shift 2
+			;;
+		--files-from)
+			FILES_FROM="$2"
+			shift 2
+			;;
+		--)
+			shift
+			break
+			;;
+		*)
+			usage
+			;;
+	esac
+done
+
+# Positional arguments that don't look like sort options must be sort targets.
+TARGETS=()
+while [ -n "$1" ] && [[ ! "$1" =~ ^-.+ ]]
+do
+	TARGETS+=("$1")
+	shift
+done
+
+# The rest of the positional arguments are sort options.
+SORT_OPTS="$@"
+
+FIRST=1
+function append_arg {
+	local arg
+
+	if [ ! -f "$FPATH" ]
+	then
+		echo "No such file '$FPATH'" >&2
+		exit 1
+	fi
+
+	local ftype=$(file -b "$FPATH" | awk -F, '{print $1}')
+	local cmd
+	case "$ftype" in
+		"gzip compressed data")
+			cmd="zcat \"$FPATH\""
+			;;
+		"bzip2 compressed data")
+			cmd="bzcat \"$FPATH\""
+			;;
+		"7-zip archive data")
+			cmd="7z x \"$FPATH\" -so"
+			;;
+		"ASCII text")
+			# Text file. No command necessary.
+			;;
+		*)
+			echo "Unsupported file type '$ftype' for '$FPATH'" >&2
+			exit 1
+			;;
+	esac
+
+	# Output the header from the first target.
+	if [ $FIRST -eq 1 ]
+	then
+		FIRST=0
+		if [ -z "$cmd" ]
+		then
+			# Text file.
+			HEADER=$(cat "$FPATH" | head -n1)
+		else
+			HEADER=$(eval "$cmd" | head -n1)
+		fi
+
+		if [ -z "$HEADER" ]
+		then
+			echo "Could not read header from '$FPATH'" >&2
+			exit 1
+		fi
+
+		echo "$HEADER"
+	fi
+
+	if [ -z "$cmd" ]
+	then
+		# Text file.
+		arg="<(tail -n +2 \"$FPATH\")"
+	else
+		arg="<($cmd | tail -n +2)"
+	fi
+
+	FILES="$FILES $arg"
+}
+
+# Build file args.
+FILES=
+if [ -n "$FILES_FROM" ]
+then
+	if [[ "$FILES_FROM" == "-" ]]
+	then
+		# Read targets from stdin.
+		while read FPATH
+		do
+			append_arg
+		done
+	else
+		# Read targets from a file.
+		while read FPATH
+		do
+			append_arg
+		done < <(cat "$FILES_FROM")
+	fi
+elif [ ${#TARGETS[@]} -gt 0 ]
+then
+	# Use targets from command line.
+	for FPATH in "${TARGETS[@]}"
+	do
+		append_arg
+	done
+else
+	# Data on stdin.
+	read HEADER
+	echo "$HEADER"
+fi
+
+# Parse the header.
+COLUMNS=($HEADER)
+declare -A SCHEMA_POSITIONS
+declare -A SCHEMA_TYPES
+for i in "${!COLUMNS[@]}"
+do
+	COLUMN="${COLUMNS[$i]}"
+
+	if [ $i -eq 0 ]
+	then
+		if [[ "$COLUMN" != "#db" ]]
+		then
+			echo "Invalid #db header" >&2
+			exit 1
+		fi
+	else
+		IFS=":" read -ra TOKENS <<< "$COLUMN"
+		COL_NAME="${TOKENS[0]}"
+		COL_TYPE="${TOKENS[1]}"
+		SCHEMA_POSITIONS["$COL_NAME"]=$i
+		SCHEMA_TYPES["$COL_NAME"]="$COL_TYPE"
+	fi
+done
+
+# Translate the keys into sort options.
+for i in "${!KEYS[@]}"
+do
+	KEY="${KEYS[$i]}"
+
+	IFS="+" read -ra TOKENS <<< "$KEY"
+	COL_NAME="${TOKENS[0]}"
+	POS=${SCHEMA_POSITIONS["$COL_NAME"]}
+	OPT="-k $POS,$POS"
+
+	if [ -z "$OPT" ]
+	then
+		echo "Invalid key column '$COL_NAME'" >&2
+		exit 1
+	fi
+
+	COL_TYPE="${SCHEMA_TYPES["$COL_NAME"]}"
+	case "$COL_TYPE" in
+		int)
+			OPT="${OPT}n"
+			;;
+		real)
+			OPT="${OPT}g"
+			;;
+	esac
+
+	OPT="${OPT}${TOKENS[1]}"
+
+	SORT_OPTS="$SORT_OPTS $OPT"
+done
+
+CMD="sort $SORT_OPTS $FILES"
+
+# Run sort.
+eval $CMD

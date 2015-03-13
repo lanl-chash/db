@@ -1,0 +1,188 @@
+#!/usr/bin/env nodejs
+// vim: ts=2 et sw=2 sts=2 syntax=javascript
+
+/**
+ * jsonsplit
+ *
+ * Copyright (c) 2015, Los Alamos National Security, LLC
+ * All rights reserved.
+ *
+ * Copyright (2015). Los Alamos National Security, LLC. This software was
+ * produced under U.S. Government contract DE-AC52-06NA25396 for Los Alamos
+ * National Laboratory (LANL), which is operated by Los Alamos National
+ * Security, LLC for the U.S. Department of Energy. The U.S. Government has
+ * rights to use, reproduce, and distribute this software. NEITHER THE
+ * GOVERNMENT NOR LOS ALAMOS NATIONAL SECURITY, LLC MAKES ANY WARRANTY, EXPRESS
+ * OR IMPLIED, OR ASSUMES ANY LIABILITY FOR THE USE OF THIS SOFTWARE. If
+ * software is modified to produce derivative works, such modified software
+ * should be clearly marked, so as not to confuse it with the version available
+ * from LANL.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ * Splits a JSON record input stream on stdin into multiple output streams.
+ *
+ * Author: Curt Hash <chash@lanl.gov>
+ */
+
+var fs = require('fs');
+var jsonpath = require('JSONPath');
+var readline = require('readline');
+var xxhash = require('xxhash');
+
+var opt = require('optimist')
+  .usage('Usage: $0 [OPTION]... [OUTPUT FILE]...')
+  .alias('n', 'parts')
+  .describe('n', 'number of output partitions')
+  .default('n', 0)
+  .alias('k', 'key')
+  .describe('k', 'partition key in JSONPATH format')
+  .alias('s', 'set')
+  .describe('s', 'treat KEY as a set')
+  .boolean('s')
+  .alias('u', 'uniq')
+  .describe('u', 'each KEY value gets its own partition')
+  .boolean('u')
+  .alias('p', 'prefix')
+  .describe('p', 'output file prefix')
+  .default('p', 'jsonsplit')
+  .alias('h', 'help')
+  .describe('h', 'output this text and exit')
+  .boolean('h');
+
+var argv = opt.argv;
+
+if (argv.h) {
+  console.log(opt.help());
+  process.exit();
+}
+
+// Outputs an error string and exits.
+function fatal(error) {
+  process.stderr.write(error + '\n');
+  process.exit(1);
+}
+
+// Sanity check argv.
+if (argv.u) {
+  if (argv._.length) {
+    fatal('output file names may not be used with -u (--uniq)');
+  } else if (argv.n) {
+    fatal('-n (--parts) may not be used with -u (--uniq)');
+  }
+} else if (argv.n < 2) {
+  fatal('-n (--parts) must be at least 2');
+}
+
+// Make sure that argv.k is an array, even if the length is 1.
+if (argv.k && !Array.isArray(argv.k)) {
+  argv.k = [argv.k];
+}
+
+// Opens the n-th output stream using the output file prefix.
+function open_prefixed(n) {
+  return fs.createWriteStream(argv.p + '.' + n);
+}
+
+// Open output files.
+var outputs = [];
+if (argv._.length) {
+  if (argv._.length != argv.n) {
+    fatal('expecting ' + argv.n + ' output file names, got ' + argv._.length);
+  }
+
+  for (var i=0; i<argv._.length; i++) {
+    outputs.push(fs.createWriteStream(argv._[i]));
+  }
+} else if (argv.n) {
+  for (var i=0; i<argv.n; i++) {
+    outputs.push(open_prefixed(i));
+  }
+}
+
+var part = 0;
+var uniq_outputs = {};
+
+// Closes all output streams.
+function close_outputs() {
+  if (outputs.length) {
+    var output = outputs.shift();
+    output.on('finish', function() {
+      close_outputs();
+    });
+    output.end();
+  }
+}
+
+// Maps each unique key to its own output stream.
+function uniq_write(key, line) {
+  if (!uniq_outputs.hasOwnProperty(key)) {
+    // New key.
+    var output = open_prefixed(part++);
+    outputs.push(output);
+    uniq_outputs[key] = output;
+  }
+  uniq_outputs[key].write(line + '\n');
+}
+
+readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+  terminal: false
+}).on('line', function(line) {
+  if (argv.k) {
+    // Partition by key.
+    var obj = JSON.parse(line);
+
+    var key = [];
+    for (var i=0; i<argv.k.length; i++) {
+      key.push(JSON.stringify(jsonpath.eval(obj, argv.k[i])));
+    }
+
+    if (argv.s) {
+      // Sort the key values in set mode.
+      key.sort();
+    }
+
+    key = key.join();
+
+    if (argv.u) {
+      // Unique partition.
+      uniq_write(key, line);
+    } else {
+      // Hash the key and select an output bin.
+      var hash = xxhash.hash(new Buffer(key), 0xDEADBEEF);
+      outputs[hash % argv.n].write(line + '\n');
+    }
+  } else {
+    // Partition by record.
+    if (!argv.u) {
+      // Round-robin split.
+      outputs[part++].write(line + '\n');
+      if (part > argv.n - 1) {
+        part = 0;
+      }
+    } else {
+      // Unique split.
+      uniq_write(line, line);
+    }
+  }
+}).on('close', function() {
+  close_outputs();
+});

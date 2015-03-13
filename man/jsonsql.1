@@ -1,0 +1,402 @@
+.TH JSONSQL 1 "November 2014" "db Manual" "db Manual"
+
+.SH NAME
+jsonsql \- Query JSON data using SQL compiled to JavaScript
+
+.SH SYNOPSIS
+\fBjsonsql\fR [\fIOPTION\fR]... [\fIQUERY\fR]
+
+.SH SUMMARY
+\fBjsonsql\fR translates a SQL query into a JavaScript program and executes it
+on JSON records that are read from stdin. The resulting JSON records are
+written to stdout.
+
+.SH DESCRIPTION
+\fBjsonsql\fR understands a query language resembling SQL. It is intended to
+allow users to filter and manipulate JSON data using a familiar syntax.
+
+.SS Queries
+.PP
+A \fIquery\fP consists of a list of projections (i.e., output fields) coupled
+with an optional boolean filter expression. The format for a \fIquery\fP is:
+.RS
+.PP
+[[\fBselect\fR] [\fBdistinct\fR] \fIprojection\fP[, \fIprojection\fP]] [\fBwhere\fR \fIexpression\fP] [\fBlimit\fR \fIinteger\fP]
+.RE
+.PP
+The \fBselect\fR keyword is optional. The \fBdistinct\fR keyword may be used to
+eliminate duplicate output records. If the query begins with either the
+\fBwhere\fR or \fBlimit\fR keyword, all fields are implicitly projected. The
+\fBlimit\fR keyword may be used to limit the number of output records.
+.PP
+A \fIprojection\fP is either \(lq*\(rq (project all fields) or an \fIexpression\fP.
+.PP
+An \fIexpression\fP is either an \fIaggregate-function-call\fP,
+\fIfunction-call\fP, \fIarray-comprehension\fP, \fIjsonpath\fP expression or a
+literal value.
+.PP
+Expressions may be combined into complex expressions using the following
+operators in decreasing order of precedence:
+.RS
+.PP
+.PD 0
+.TP
+.B ( \fIexpression\fP )
+Returns the value of \fIexpression\fP. This may be used to override the normal
+precedence of operators.
+.TP
+.B ^
+Exponentiation.
+.TP
+.B - + !
+Unary plus, minus and logical negation.
+.TP
+.B ||
+String concatenation.
+.TP
+.B * / %
+Multiplication, division and modulus.
+.TP
+.B + -
+Addition and subtraction.
+.TP
+.B < <= > >=
+Relational.
+.TP
+.B = == !=
+Equality.
+.TP
+.B ~ !~
+Matching and non-matching. The right operand must be a regular expression
+(i.e., /\fIregular-expression\fP/).
+.TP
+.B not like
+Not like \fIpattern\fP. The right operand must be an expression that evaluates
+to a string containing 1 or more \(lq%\(rq characters as wildcards.
+.TP
+.B like
+Like \fIpattern\fP. The right operand must be an expression that evaluates to a
+string containing 1 or more \(lq%\(rq characters as wildcards.
+.TP
+.B and
+Logical and.
+.TP
+.B or
+Logical or.
+.PD
+.RE
+.PP
+Expressions may be aliased. If not aliased, \fBjsonsql\fR will choose a field
+name (often just \(lqexpr\(rq). Note that \fBjsonsql\fR does not allow
+duplicate output field names. As such, aliasing is often necessary. The format
+for an \fIalias\fR is:
+.RS
+.PP
+\fIexpression\fP [\fBas\fR \fIalias-name\fP]
+.RE
+.PP
+An \fIaggregate-function-call\fP is a function that computes a single result
+over multiple input records (e.g., \fBsum()\fR). Input records are implicitly
+grouped by the values of any non-aggregate projections. The format for an
+\fIaggregate-function-call\fP is:
+.RS
+.PP
+\fIfunc-name\fP([\fBdistinct\fR] \fIexpression\fP)
+.RE
+.PP
+The \fBdistinct\fR keyword may be used within an aggregate function to limit
+the function to distinct values of the \fIexpression\fP.
+.PP
+Normal (non-aggregate) functions may take 0 or more expressions as arguments.
+The format for a \fIfunction-call\fP is:
+.RS
+.PP
+\fIfunc-name\fP(\fIexpression\fP[, \fIexpression\fP])
+.RE
+.PP
+An \fIarray-comprehension\fP is an expression that returns a new array where
+each element is the result of some operations applied to each element of
+another array. It is nearly identical to the list comprehension construct in
+Python. The format for an \fIarray-comprehension\fP is:
+.RS
+.PP
+[\fIelement-expression\fP \fBfor\fR \fIidentifier\fP in \fIarray-expression\fP
+[\fBif\fR \fIfilter-expression\fP]]
+.RE
+.PP
+The \fIelement-expression\fP is evaluated on each element of the
+\fIarray-expression\fP. The resulting values are stored and returned as a new
+array. The optional \fIfilter-expression\fP can be used to filter the new array
+values: the new value will only be added to the result array if the
+\fIfilter-expression\fR evaluates to true. Both expressions may reference
+\fIidentifier\fP, which is the value of the current element of the
+\fIarray-expression\fP.
+.PP
+A \fIjsonpath\fP expression is used to reference fields in the JSON data. They
+take the place of column names in the \fBjsonsql\fR flavor of SQL. For detailed
+information about JSONPath, see https://www.npmjs.org/package/JSONPath.
+
+.SS Aggregate Functions
+.PP
+Aggregate functions operate on groups of input records. Input records are
+partitioned into groups according to the combined values of the non-aggregate
+projections in a query. If a query contains no non-aggregate projections, the
+entire input is a single group.
+.PP
+The following is a list of aggregate functions that \fBjsonsql\fR supports with
+their description and usage.
+.RS
+.PP
+.PD 0
+.TP
+.B avg(\fIexpression\fP)
+Returns the average of \fIexpression\fP within a group.
+.TP
+.B count(\fIexpression\fP), count(*)
+Returns the total number of records in a group.
+.TP
+.B max(\fIexpression\fP)
+Returns the maximum value of \fIexpression\fP within a group.
+.TP
+.B min(\fIexpression\fP)
+Returns the minimum value of \fIexpression\fP within a group.
+.TP
+.B sum(\fIexpression\fP), total(\fIexpression\fP)
+Returns the sum of \fIexpression\fP within a group.
+.PD
+.RE
+
+.SS Functions
+.PP
+The following is a list of non-aggregate functions that \fBjsonsql\fR supports
+with their description and usage.
+.RS
+.PP
+.PD 0
+.TP
+.B abs(\fInumber\fP)
+Returns the absolute value of \fInumber\fP.
+.TP
+.B all(\fIarray\fP)
+Returns true if all of the elements of \fIarray\fP evaluate to true.
+.TP
+.B any(\fIarray\fP)
+Returns true if any of the elements of \fIarray\fP evaluate to true.
+.TP
+.B array_avg(\fIarray\fP)
+Returns the average value of the \fIarray\fP elements.
+.TP
+.B array_len(\fIarray\fP)
+Returns the length of \fIarray\fP.
+.TP
+.B array_max(\fIarray\fP)
+Returns the maximum value of the \fIarray\fP elements.
+.TP
+.B array_min(\fIarray\fP)
+Returns the minimum value of the \fIarray\fP elements.
+.TP
+.B array_sum(\fIarray\fP)
+Returns the sum of the \fIarray\fP elements.
+.TP
+.B cidr_contains(\fIcidr-string\fP, \fIip-string\fP)
+Returns true if \fIip-string\fP is in the network described by
+\fIcidr-string\fP, false otherwise.
+.TP
+.B concat(\fIarray\fP, \fIarray\fP...)
+Returns the concatenation of all of the \fIarray\fP arguments.
+.TP
+.B flatten(\fIarray\fP)
+Returns the concatenation of the array elements within the \fIarray\fP.
+.TP
+.B int(\fInumber\fP)
+Returns \fInumber\fP truncated to the nearest integer.
+.TP
+.B ip_mask(\fIip-string\fP, \fImask-string\fP)
+Returns a dotted-quad string after applying \fImask-string\fP to the
+\fIip-string\fP.
+.TP
+.B length(\fIstring\fP)
+Returns the length of \fIstring\fP.
+.TP
+.B lower(\fIstring\fP)
+Returns \fIstring\fP converted to lowercase.
+.TP
+.B ltrim(\fIstring\fP)
+Returns \fIstring\fP with whitespace characters removed from the left only.
+.TP
+.B map(\fIfunction\fP, \fIarray\fP)
+Returns an array containing the elements resulting from applying \fIfunction\fP
+to each element of \fIarray\fP.
+.TP
+.B max(\fIexpression\fP, \fIexpression\fP...)
+Returns the maximum value of the expressions.
+.TP
+.B min(\fIexpression\fP, \fIexpression\fP...)
+Returns the minimum value of the expressions.
+.TP
+.B replace(\fIstring\fP, \fIregular-expression\fP, \fIreplacement\fP)
+Replaces all of the longest, leftmost, non-overlapping substrings of
+\fIstring\fP matching \fIregular-expression\fP with \fIreplacement\fP.
+.TP
+.B rtrim(\fIstring\fP)
+Returns \fIstring\fP with whitespace characters removed from the right only.
+.TP
+.B strftime(\fIformat\fP[, \fItimestamp\fP])
+Returns the epoch \fItimestamp\fP formatted according to the \fIformat\fP
+string. If \fItimestamp\fP is not specified, it defaults to the current time.
+.TP
+.B submatch(\fIstring\fP, \fIregular-expression\fP, \fIgroup-number\fP)
+Returns the substring of \fIstring\fP matched by the \fIgroup-number\fP-th
+parenthesized group of \fIregular-expression\fP.  Group number 0 indicates the
+entire matched string, number 1 is the leftmost parenthesized group and so on.
+.TP
+.B substr(\fIstring\fP, \fIstart\fP[, \fIlength\fP])
+Returns the \fIlength\fP-character substring of \fIstring\fP, starting at
+character number \fIstart\fP. If \fIlength\fP is omitted, the whole suffix of
+\fIstring\fP that begins at character number \fIstart\fP is returned.
+.TP
+.B trim(\fIstring\fP)
+Returns \fIstring\fP with whitespace characters removed from both the left and
+right.
+.TP
+.B upper(\fIstring\fP)
+Returns \fIstring\fP converted to uppercase.
+.PD
+.RE
+
+.SH ARGUMENTS
+.TP
+\fBQUERY\fR
+Parse and execute the specified \fIQUERY\fR.
+
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Output usage and exit.
+.TP
+\fB\-D\fR, \fB\-\-debug\fR
+Translate \fIQUERY\fR to JavaScript and write the JavaScript source code to
+stdout. Do not execute.
+
+.SH EXAMPLES
+.B jsonsql 'limit 10'
+
+Output the first 10 records.
+
+.P
+.B jsonsql 'where $.ip = \(dq192.168.1.1\(dq limit 10'
+.br
+.B jsonsql '* where $.ip = \(dq192.168.1.1\(dq limit 10'
+.br
+.B jsonsql 'select * where $.ip = \(dq192.168.1.1\(dq limit 10'
+
+Output the first 10 records where the top-level \fBip\fR field is equal to
+\(lq192.168.1.1\(rq.
+
+.P
+.B jsonsql '$.ip'
+
+Output the top-level \fBip\fR field from all records.
+
+.P
+.B jsonsql 'distinct $.ip'
+
+Output all distinct values of the top-level \fBip\fR field in the order in
+which they are read.
+
+.P
+.B jsonsql '$.ip, count(*)'
+.br
+.B jsonsql '$.ip, count($.ip)'
+
+For each distinct value of the top-level \fBip\fR field, output the value and
+the number of records with that value.
+
+.P
+.B jsonsql '$.ip, max($.bytes)'
+
+For each distinct value of the top-level \fBip\fR field, output the value and
+the maximum value of the top-level \fBbytes\fR field in records with that
+value.
+
+.P
+.B jsonsql 'where max($.src_bytes, $.dst_bytes) > 0'
+.br
+.B jsonsql 'where $.src_bytes > 0 or $.dst_bytes > 0'
+.br
+.B jsonsql 'where (($.src_bytes > 0) or ($.dst_bytes > 0))'
+
+Output records where the either the top-level \fBsrc_bytes\fR or
+\fBdst_bytes\fR field value is greater than zero.
+
+.P
+.B jsonsql '$.src_bytes + $.dst_bytes as all_bytes'
+
+Output the sum of the top-level \fBsrc_bytes\fR and \fBdst_bytes\fR field
+values as a new field named \(lqall_bytes\(rq.
+
+.P
+.B jsonsql 'count(distinct $.ip)'
+
+Output the number of distinct values of the top-level \fBip\fR field.
+
+.P
+.B jsonsql '$.ip, count(distinct *)'
+
+For each distinct value of the top-level \fBip\fR field, output the value and
+the number of distinct records with that value.
+
+.P
+.B jsonsql '\(dqhttp://\(dq || $.url as url'
+
+Prepend \(lqhttp://\(rq to every value of the top-level \fBurl\fR field and
+output the new value.
+
+.P
+.B jsonsql 'max(max($.src_bytes), max($.dst_bytes))'
+
+Output the maximum of the maximum values of the top-level \fBsrc_bytes\fR and
+\fBdst_bytes\fR fields across all records.
+
+.P
+.B jsonsql 'distinct $.ip where $.ip ~ /^192\\\\.168.+\\\\.5$/'
+
+Output all distinct values of the top-level \fBip\fR field where the value
+begins with \(lq192.168\(rq and ends with \(lq.5\(rq.
+
+.P
+.B jsonsql 'replace($.ip, /^[0-9]{1,3}\\\\.[0-9]{1,3}\\\\./, \(dq0.0.\(dq) as ip'
+
+Replace the first two octets of the \fBip\fR column value with 0 and output the
+new value.
+
+.P
+.B jsonsql 'where cidr_contains(\(dq192.168.0.0/16\(dq, $.ip)'
+.br
+.B jsonsql 'where ip_mask(ip, \(dq255.255.0.0\(dq) = \(dq192.168.0.0\(dq'
+
+Returns all records where the top-level \fBip\fR field value is in the
+192.168.0.0/16 network.
+
+.P
+.B jsonsql 'strftime("%Y-%m-%d %H:%M:%S%z", $.epoch) as timestamp'
+
+Outputs a field named \fBtimestamp\fR containing the values of the top-level
+\fBepoch\fR field converted to timestamps like \(lq2014-09-24
+18:41:00-0600\(rq.
+
+.P
+.B jsonsql 'where submatch($.sip, /^(([0-9]+\\\\.){3})[0-9]+$/, 1) != submatch($.dip, /^(([0-9]+\\\\.){3})[0-9]+$/, 1)'
+.br
+.B jsonsql 'where ip_mask($.sip, \(dq255.255.255.0\(dq) != ip_mask($.dip, \(dq255.255.255.0\(dq)'
+
+Outputs all records where the values of the top-level \fBsip\fR and \fBdip\fR
+fields (which are IP addresses in dotted-quad format) are not on the same /24
+network.  For clarity, the calls to the \fBsubmatch()\fR function are returning
+the portion of the value matched by \(lq([0-9]+\\.){3}\(rq (i.e., group 1).
+
+.SH SEE ALSO
+dbsqawk(1)
+
+.SH AUTHOR
+Written by Curt Hash.

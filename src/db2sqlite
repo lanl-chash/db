@@ -1,0 +1,140 @@
+#!/usr/bin/env python
+# vim: ts=4 et sw=4 sts=4 syntax=python
+
+"""db2sqlite
+
+Copyright (c) 2015, Los Alamos National Security, LLC
+All rights reserved.
+
+Copyright (2015). Los Alamos National Security, LLC. This software was produced
+under U.S. Government contract DE-AC52-06NA25396 for Los Alamos National
+Laboratory (LANL), which is operated by Los Alamos National Security, LLC for
+the U.S. Department of Energy. The U.S. Government has rights to use,
+reproduce, and distribute this software. NEITHER THE GOVERNMENT NOR LOS ALAMOS
+NATIONAL SECURITY, LLC MAKES ANY WARRANTY, EXPRESS OR IMPLIED, OR ASSUMES ANY
+LIABILITY FOR THE USE OF THIS SOFTWARE. If software is modified to produce
+derivative works, such modified software should be clearly marked, so as not to
+confuse it with the version available from LANL.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Import a db table on stdin to an sqlite3 database.
+
+Author: Curt Hash <chash@lanl.gov>
+
+"""
+
+import argparse
+import os
+import subprocess
+import sqlite3
+import sys
+import tempfile
+
+import db
+
+
+PRAGMAS = [
+    'PRAGMA synchronous = OFF;',
+    'PRAGMA journal_mode = OFF;',
+    'PRAGMA cache_size = 200000;',
+    'PRAGMA temp_store = 2;',
+    'PRAGMA locking_mode = exclusive;'
+]
+
+
+def sqlite_import(table, ddl, outfile):
+    """Imports data using the sqlite3 command line .import command. This is
+    faster, however it doesn't work if data values contain quotes.
+
+    """
+    # Create a SQL script, because sqlite3 will only execute multiple
+    # statements on stdin and we have data on stdin.
+    _, tmpfile = tempfile.mkstemp(suffix='.sql', prefix='db2sqlite.')
+
+    sql = open(tmpfile, 'w')
+    print >> sql, ddl
+    for pragma in PRAGMAS:
+        print >> sql, pragma
+    print >> sql, '.separator "\t"'
+    print >> sql, '.import /dev/stdin %s' % table
+    sql.close()
+
+    status = subprocess.call(['sqlite3', outfile, '-init', tmpfile])
+
+    os.unlink(tmpfile)
+
+    return status
+
+
+def sqlite_import_python(table, ddl, ncols, outfile):
+    """Imports data using the sqlite3 Python module. """
+    conn = sqlite3.connect(outfile)
+    cursor = conn.cursor()
+    cursor.execute(ddl)
+    map(cursor.execute, PRAGMAS)
+
+    insert_stmt = 'INSERT INTO %s VALUES (%s)' % \
+                  (table, ', '.join(['?'] * ncols))
+
+    generator = (line.rstrip('\r\n').split('\t') for line in sys.stdin)
+
+    cursor.executemany(insert_stmt, generator)
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def main():
+    """Creates an sqlite3 database. """
+    parser = argparse.ArgumentParser()
+    parser.add_argument('outfile', help='output file path')
+    parser.add_argument('-t', '--table', default="db",
+                        help='table name, default: %(default)s')
+    parser.add_argument('-f', '--fast', action='store_true',
+                        help='use .import (breaks if values contain quotes)')
+    args = parser.parse_args()
+
+    header = db.read_header()
+    schema = db.parse_header(header)
+
+    columns = schema.items()
+
+    # Sort by position.
+    columns.sort(key=lambda i: i[1][0])
+
+    type_map = {
+        'str' : 'text',
+        'int' : 'integer'
+    }
+
+    ddl = 'CREATE TABLE %s (%s);' % \
+          (args.table,
+           ', '.join('%s %s' % (column, type_map.get(datatype, datatype))
+                                for column, (_, datatype) in columns))
+
+    if args.fast:
+        return sqlite_import(args.table, ddl, args.outfile)
+
+    return sqlite_import_python(args.table, ddl, len(schema), args.outfile)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

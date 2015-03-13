@@ -1,0 +1,61 @@
+.TH DBFILTER-CIDR 1 "November 2014" "db Manual" "db Manual"
+
+.SH NAME
+dbfilter-cidr \- Filter db data records based on their IPv4 address fields
+
+.SH SYNOPSIS
+<data> | \fBdbfilter-cidr\fR [\fIOPTION\fR]... FILTER_FILE
+
+.SH SUMMARY
+\fBdbfilter-cidr\fR filters db data records read from stdin based on include
+and exclude rules specified in the \fIFILTER_FILE\fR. To be included in the
+output, records must match at least one include rule (unless there are no
+include rules) and must not match any exclude rules. Records that pass the
+filter are printed to stdout.
+
+.SH FILTER SYNTAX
+The \fIFILTER_FILE\fR should contain a list of rules with the following syntax:
+.P
+[+|-]\fICIDR\fR \fICOLUMN\fR[,\fICOLUMN\fR]...
+.P
+\(lq+\(rq denotes an include rule and \(lq-\(rq denotes an exclude rule. Lines
+beginning with \(lq#\(rq are ignored.
+
+.SH FILTER EXAMPLES
+.P
+.B +192.168.0.0/16 src,dst
+
+Include a record if the IPv4 address in both the \(lqsrc\(rq and \(lqdst\(rq
+columns belongs to the 192.168.0.0/16 class B network.
+
+.P
+.B -192.168.15.0/24 src,dst
+
+Exclude a record if the IPv4 address in either the \(lqsrc\(rq or \(lqdst\(rq
+column belongs to the 192.168.15.0/24 class C network.
+
+.P
+.B -192.168.1.1 src,dst
+
+Exclude a record if the IPv4 address in either the \(lqsrc\(rq or \(lqdst\(rq
+column is \(lq192.168.1.1\(rq.
+
+.SH ARGUMENTS
+.TP
+\fBFILTER_FILE\fR
+Specify the path of a filter file.
+
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Output usage and exit.
+
+.SH EXAMPLES
+.P
+.B dbfilter-cidr filter.txt
+
+Read records from stdin and filter them using the filter rules in
+\(lqfilter.txt\(rq.
+
+.SH AUTHOR
+Written by Curt Hash.

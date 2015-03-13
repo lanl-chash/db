@@ -1,0 +1,47 @@
+.TH DBCAT 1 "November 2014" "db Manual" "db Manual"
+
+.SH NAME
+dbcat \- Print db records to stdout
+
+.SH SYNOPSIS
+\fBdbcat\fR [\fIOPTION\fR]... \fIPATH\fR [\fIPATH\fR]...
+.br
+<file list> | \fBdbcat\fR [\fIOPTION\fR]...
+
+.SH SUMMARY
+\fBdbcat\fR takes a list of db data files as arguments or from stdin and
+outputs their contents to stdout. The program \fBassumes\fR that all of the
+files have identical #db headers. Input data files can be uncompressed, gzip
+compressed data, bzip2 compressed data or 7-zip archive data.
+
+.SH ARGUMENTS
+.TP
+\fBPATH\fR
+Specify the path of a file to cat.
+
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Output usage and exit.
+.TP
+\fB\-m\fR, \fB\-\-mux\fR
+By default, the input data records are read from the input files in the order
+specified. If this option is set, \fBdbcat\fR will multiplex the inputs, which
+can be faster; however, the order of the records will be altered.
+
+.SH EXAMPLES
+.P
+.B dbcat foo.gz bar.bz2
+
+Uncompress and concatenate the contents of \(lqfoo.gz\(rq and \(lqbar.bz2\(rq.
+
+.P
+.B echo -e \(dqfoo.gz\\\\nbar.gz\(dq | dbcat -m
+
+Uncompress and multiplex the contents of \(lqfoo.gz\(rq and \(lqbar.gz\(rq.
+
+.SH SEE ALSO
+jsoncat(1)
+
+.SH AUTHOR
+Written by Curt Hash.

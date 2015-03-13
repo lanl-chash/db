@@ -1,0 +1,964 @@
+#!/usr/bin/env python
+# vim: ts=4 et sw=4 sts=4 syntax=python
+
+"""timefind
+
+Copyright (c) 2015, Los Alamos National Security, LLC
+All rights reserved.
+
+Copyright (2015). Los Alamos National Security, LLC. This software was produced
+under U.S. Government contract DE-AC52-06NA25396 for Los Alamos National
+Laboratory (LANL), which is operated by Los Alamos National Security, LLC for
+the U.S. Department of Energy. The U.S. Government has rights to use,
+reproduce, and distribute this software. NEITHER THE GOVERNMENT NOR LOS ALAMOS
+NATIONAL SECURITY, LLC MAKES ANY WARRANTY, EXPRESS OR IMPLIED, OR ASSUMES ANY
+LIABILITY FOR THE USE OF THIS SOFTWARE. If software is modified to produce
+derivative works, such modified software should be clearly marked, so as not to
+confuse it with the version available from LANL.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Returns files from a data source that overlap a given time period.
+
+A data source is defined as a set of globs for directories to search, plus a
+set of include/exclude globs for file names found within the directories.
+
+This program supports 2 methods of determining whether a file overlaps the time
+period:
+
+1. Fuzzy method
+
+Files within the data source are partitioned into sets according to the
+non-time-related strings in their paths. For each file in a set, a timestamp is
+extracted from the path. The files in a set are then sorted by their timestmap
+into a time series. The data in a file is assumed to begin at the timestamp
+from the file's path and end at the timestamp extracted from the next file in
+the series.
+
+This method makes a number of assumptions about your directory layout, file
+names and timestamp representations. Make sure that you TEST any configuration
+changes using -d (--debug). NEVER assume the output is correct.
+
+2. Index method
+
+This method queries a pre-computed index that stores the begin and end
+timestamps for each file in a data source. The timestamps are extracted from
+the data itself.
+
+Author: Curt Hash <chash@lanl.gov>
+
+"""
+
+import abc
+import argparse
+import datetime
+import fnmatch
+import glob
+import multiprocessing
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+
+from itertools import chain
+
+import dateutil.parser
+import dateutil.tz
+import flufl.lock
+
+from configobj import ConfigObj, flatten_errors
+from validate import Validator
+
+
+DEBUG = False
+TZ_LOCAL = dateutil.tz.tzlocal()
+
+# Used to tokenize paths into time and non-time parts. Note that we split on -
+# only if it's followed or preceded by a letter to avoid splitting strings like
+# 23:59:59-0600 and 2013-01-01.
+RE_SEPARATORS = re.compile(r'(?:[/\._\s]|-(?=[a-z])|(?<=[a-z])-)+', re.I)
+
+RE_TIME_TOKEN = re.compile(r'^[0-9:-]+$')
+
+
+def debug(fmt, *args):
+    """Prints a debug message to stdout. """
+    if DEBUG:
+        print 'DEBUG: ' + fmt % args
+
+
+def extract_bluecoat(path):
+    """Extracts a datetime from a bluecoat log path.
+
+    The year is not encoded in the file name and there are extra numbers in the
+    file name that confuse dateutil.
+
+    e.g., bluecoat/2014/01/31/blueone/SG_main__60131080000.log.gz
+
+    */%Y/%m/%d/*/*%m%d%H%M%S*
+
+    """
+    dirname, basename = os.path.split(path)
+
+    year = None
+    for token in dirname.split('/'):
+        if token.isdigit() and len(token) == 4:
+            year = token
+            break
+
+    timestr = year + basename.split('.', 1)[0][-10:]
+    return dateutil.parser.parse(timestr)
+
+
+# Sometimes a custom extractor is required.
+EXTRACTORS = {
+    'bluecoat' : {
+        'func' : extract_bluecoat,
+        'desc' : 'e.g. bluecoat/2014/01/31/blueone/SG_main__60131080000.log.gz'
+    }
+}
+
+
+def extract_smart(path):
+    """Attempts to automagically extract a datetime from `path`. """
+    tokens = [t for t in RE_SEPARATORS.split(os.path.basename(path))
+              if RE_TIME_TOKEN.match(t)]
+
+    timestr = ' '.join(tokens)
+    if not timestr:
+        raise ValueError('empty timestr')
+
+    # dateutil fills in missing datetime information with the specified default
+    # datetime. Set the default to the minimum representable datetime so that,
+    # in the event a weird file is encountered, it's likely to fall outside of
+    # [begin, end].
+    default = datetime.datetime.min
+
+    try:
+        dtime = dateutil.parser.parse(timestr, default=default, fuzzy=True)
+    except ValueError:
+        pass
+    else:
+        if dtime.year == 1:
+            # dateutil filled with datetime.min
+            raise ValueError('nope')
+
+        return dtime
+
+    # Maybe it's an epoch time?
+    timestr = '.'.join(tokens[:2])
+    return datetime.datetime.fromtimestamp(float(timestr))
+
+
+def extract_dtime(string, extractor=None):
+    """Tries to extract a datetime from the string. """
+    if not string:
+        return None
+
+    try:
+        if not extractor:
+            # Use the default "smart" extractor.
+            dtime = extract_smart(string)
+        else:
+            # Use the specified extractor function.
+            dtime = extractor(string)
+    except ValueError:
+        debug('could not extract a datetime from "%s"', string)
+        return None
+
+    return dtime_to_local(dtime)
+
+
+def get_path_key(path):
+    """Some directory structures contain multiple, overlapping time series
+    data. This function attempts to derive a key from a file path that will
+    partition the multiple data sets correctly.
+
+    For example:
+
+    /data/gears/squid/2014/01/proxy-s1/squid.20140101.gz
+    /data/gears/squid/2014/01/proxy-s2/squid.20140101.gz
+
+    The two files above belong to different, overlapping data sets, but the
+    file names are the same. What do?
+
+    This function would return the following keys for those paths:
+
+    datagearssquidproxys1squidgz
+    datagearssquidproxys2squidgz
+
+    """
+    return ''.join(t for t in RE_SEPARATORS.split(path)
+                   if not RE_TIME_TOKEN.match(t))
+
+
+def dtime_to_local(dtime):
+    """Converts a datetime to local time and returns it. """
+    if not dtime.tzinfo:
+        # Naive datetime. Assume local time.
+        dtime = dtime.replace(tzinfo=TZ_LOCAL)
+    else:
+        # Timezone-aware datetime. Convert to local time.
+        dtime = dtime.astimezone(TZ_LOCAL)
+
+    return dtime
+
+
+def dtime_to_epoch(dtime):
+    """Converts a datetime in local time to epoch time and returns it. """
+    return time.mktime(dtime.timetuple()) + dtime.microsecond / 1000000.0
+
+
+def epoch_to_dtime(epoch):
+    """Converts an epoch time to a local datetime. """
+    dtime = datetime.datetime.fromtimestamp(epoch)
+    return dtime_to_local(dtime)
+
+
+class AbstractIndex(object):
+
+    """Abstract base class for index implementations. """
+
+    __metaclass__ = abc.ABCMeta
+
+    @abc.abstractmethod
+    def add(self, path, min_time, max_time):
+        """Adds `path` to the index. """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def remove(self, path):
+        """Removes `path` from the index. """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def clean(self):
+        """Removes missing files from the index. """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def indexed(self, path):
+        """Returns True if `path` is indexed, False otherwise. """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def query(self, begin=None, end=None):
+        """Returns a list of (PATH, MIN_EPOCH, MAX_EPOCH) tuples for files that
+        overlap the time period.
+
+        """
+        raise NotImplementedError
+
+    def close(self):
+        """Closes the index. """
+        pass
+
+
+class SqliteIndex(AbstractIndex):
+
+    """AbstractIndex implemented using sqlite3.
+
+    DO NOT USE VIA NFS!
+
+    """
+
+    def __init__(self, path):
+        dirname = os.path.dirname(path)
+        if not os.path.exists(dirname):
+            os.makedirs(dirname, 0775)
+
+        self._connection = sqlite3.connect(path)
+        self._cursor = self._connection.cursor()
+
+        self._exec('''
+            CREATE TABLE IF NOT EXISTS idx(
+                path TEXT PRIMARY KEY,
+                min_time REAL,
+                max_time REAL)
+            ''')
+
+    def _exec(self, query, *args):
+        """Handles concurrent executes by looping while the database is locked.
+
+        """
+        while True:
+            try:
+                return self._cursor.execute(query, args)
+            except sqlite3.OperationalError as error:
+                if not 'locked' in str(error):
+                    raise
+            else:
+                break
+
+    def _commit(self):
+        """Commits pending changes. """
+        self._connection.commit()
+
+    def add(self, path, min_time, max_time):
+        """Adds a file to the index. """
+        self._exec('''
+            INSERT INTO idx(path, min_time, max_time)
+            VALUES (?, ?, ?)
+            ''', path, min_time, max_time)
+
+        self._commit()
+
+    def remove(self, path):
+        """Removes a file from the index. """
+        self._exec('''
+            DELETE
+            FROM idx
+            WHERE path = ?
+            ''', path)
+
+        self._commit()
+
+    def clean(self):
+        """Removes paths that no longer exist from the index. """
+        self._exec('''
+            SELECT path
+            FROM idx
+            ''')
+
+        for row in self._cursor:
+            path = row[0]
+            if not os.path.exists(path):
+                self.remove(path)
+
+    def indexed(self, path):
+        """Returns True if the file is indexed, False otherwise. """
+        self._exec('''
+            SELECT 1
+            FROM idx
+            WHERE path = ?
+            LIMIT 1
+            ''', path)
+
+        return bool(self._cursor.fetchone())
+
+    def query(self, begin=None, end=None):
+        """Returns a list of (PATH, MIN_EPOCH, MAX_EPOCH) tuples for files that
+        overlap the time period.
+
+        """
+        query = '''
+            SELECT path, min_time, max_time
+            FROM idx
+            '''
+
+        clauses = []
+        args = []
+
+        if begin is not None:
+            clauses.append('? <= max_time')
+            args.append(begin)
+
+        if end is not None:
+            clauses.append('min_time <= ?')
+            args.append(end)
+
+        if clauses:
+            query += ' WHERE ' + ' AND '.join(clauses)
+
+        self._exec(query, *args)
+
+        return self._cursor.fetchall()
+
+    def close(self):
+        """Closes the cursor and connection. """
+        self._cursor.close()
+        self._connection.close()
+
+    def __del__(self):
+        """Makes sure the database is closed. """
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class SqliteNFSIndex(SqliteIndex):
+
+    """AbstractIndex implemented using sqlite3 with an external, NFS-safe lock
+    provided by the flufl.lock library.
+
+    """
+
+    def __init__(self, path):
+        self.__lock = flufl.lock.Lock(path + '.lock')
+        self.__lock.lifetime = datetime.timedelta(seconds=600)
+        self._lock_count = 0
+
+        self._lock()
+        super(SqliteNFSIndex, self).__init__(path)
+        self._unlock()
+
+    def _lock(self):
+        """Acquires the lock. """
+        self.__lock.lock()
+
+    def _unlock(self):
+        """Releases the lock. """
+        self.__lock.unlock()
+
+    def add(self, path, min_time, max_time):
+        """Adds `path` to the index. """
+        self._lock()
+        super(SqliteNFSIndex, self).add(path, min_time, max_time)
+        self._unlock()
+
+    def remove(self, path):
+        """Removes `path` from the index. """
+        self._lock()
+        super(SqliteNFSIndex, self).remove(path)
+        self._unlock()
+
+    def clean(self):
+        """Removes missing files from the index. """
+        self._lock()
+        super(SqliteNFSIndex, self).clean()
+        self._unlock()
+
+    def indexed(self, path):
+        """Returns True if `path` is indexed, False otherwise. """
+        self._lock()
+        indexed = super(SqliteNFSIndex, self).indexed(path)
+        self._unlock()
+
+        return indexed
+
+    def query(self, begin=None, end=None):
+        """Yields (PATH, MIN_EPOCH, MAX_EPOCH) tuples for files that overlap
+        the time period.
+
+        """
+        self._lock()
+        results = super(SqliteNFSIndex, self).query(begin, end)
+        self._unlock()
+
+        return results
+
+
+INDEX_TYPES = {
+    'sqlite' : SqliteIndex,
+    'sqlite_nfs' : SqliteNFSIndex
+}
+
+
+def get_index(index_type, index_path):
+    """Returns an index object. """
+    return INDEX_TYPES[index_type](index_path)
+
+
+def get_interval(indexer, path):
+    """Determines the minimum and maximum time covered by a file. """
+    process = subprocess.Popen([indexer, path], stdout=subprocess.PIPE)
+
+    stdout, _ = process.communicate()
+
+    status = process.returncode
+    if status != 0:
+        raise ValueError('%s exited with status %d' % (indexer, status))
+
+    _, min_time, max_time = stdout.splitlines()[0].rstrip().split('|')
+
+    return (path, float(min_time), float(max_time))
+
+
+class DataSourceDescriptor(object):
+
+    """Describes some of the files belonging to a data source. """
+
+    def __init__(self, name, paths, include=None, exclude=None,
+                 file_time_is_end_time=True, extractor=None,
+                 index_type='sqlite', index_path=None, indexer=None):
+        self.name = name
+        self.paths = paths
+        self.include = include
+        self.exclude = exclude
+        self.file_time_is_end_time = file_time_is_end_time
+        self.index_type = index_type
+        self.index_path = index_path
+        self.indexer = indexer
+
+        if extractor:
+            self.extractor = EXTRACTORS[extractor]['func']
+        else:
+            self.extractor = None
+
+    def _include(self, filename):
+        """Returns True if `filename` should be included, False otherwise. """
+        if not self.include:
+            return True
+
+        return any(fnmatch.fnmatch(filename, p) for p in self.include)
+
+    def _exclude(self, filename):
+        """Returns True if `filename` should be excluded, False otherwise. """
+        if not self.exclude:
+            return False
+
+        return any(fnmatch.fnmatch(filename, p) for p in self.exclude)
+
+    def find(self):
+        """Yields the absolute paths of this set of files. """
+        for path_glob in self.paths:
+            for path in glob.glob(path_glob):
+                path = os.path.abspath(path)
+
+                for dirname, _, filenames in os.walk(path, followlinks=True):
+                    for filename in filenames:
+                        if not self._include(filename):
+                            continue
+
+                        if self._exclude(filename):
+                            continue
+
+                        yield os.path.join(dirname, filename)
+
+    def index(self, begin=None, end=None,
+              processes=multiprocessing.cpu_count()):
+        """Creates or updates the index for this set of files. """
+        for attr in ['index_type', 'index_path', 'indexer']:
+            if not getattr(self, attr):
+                raise ValueError('"%s" is missing %s=' % (self.name, attr))
+
+        if begin or end:
+            # Index over some fuzzy time period.
+            paths = self.fuzzy_search(begin, end)
+        else:
+            # Index all files.
+            paths = self.find()
+
+        index = get_index(self.index_type, self.index_path)
+        pool = multiprocessing.Pool(processes)
+        results = []
+
+        for path, _, _ in paths:
+            # Distribute jobs to the pool.
+            if not index.indexed(path):
+                args = (self.indexer, path)
+                results.append(pool.apply_async(get_interval, args))
+
+        pool.close()
+        pool.join()
+
+        for result in results:
+            # Add the results to the index.
+            index.add(*result.get())
+
+        index.close()
+
+    def index_clean(self):
+        """Removes missing files from the index. """
+        index = get_index(self.index_type, self.index_path)
+        index.clean()
+        index.close()
+
+    def index_search(self, begin=None, end=None):
+        """Yields a sequence of (PATH, BEGIN_DATETIME, END_DATETIME) tuples for
+        this set of files. The begin and end times are derived from the data.
+
+        """
+        for attr in ['index_type', 'index_path']:
+            if not getattr(self, attr):
+                raise ValueError('"%s" is missing %s=' % (self.name, attr))
+
+        if not os.path.exists(self.index_path):
+            raise OSError('index "%s" does not exist' % self.index_path)
+
+        if begin:
+            begin = dtime_to_epoch(begin)
+
+        if end:
+            end = dtime_to_epoch(end)
+
+            # Warn if the index was last modified prior to the end of the
+            # search interval. It may need to be updated.
+            mtime = os.path.getmtime(self.index_path)
+            if mtime < end:
+                print >> sys.stderr, ('WARNING: interval end is newer than '
+                                      'index "%s"' % self.index_path)
+
+        index = get_index(self.index_type, self.index_path)
+
+        for path, min_time, max_time in index.query(begin, end):
+            yield path, epoch_to_dtime(min_time), epoch_to_dtime(max_time)
+
+        index.close()
+
+    def fuzzy_search(self, begin=None, end=None):
+        """Yields a sequence of (PATH, BEGIN_DATETIME, END_DATETIME) tuples for
+        this set of files. The begin and end times are derived from the file
+        paths.
+
+        """
+        found = {}
+
+        # Find all files within this set of files and partition them into
+        # (hopefully) non-overlapping time series.
+        for path in self.find():
+            file_time = extract_dtime(path, self.extractor)
+            if not file_time:
+                # Extraction failed.
+                continue
+
+            key = get_path_key(path)
+            if key in found:
+                found[key].append((path, file_time))
+            else:
+                found[key] = [(path, file_time)]
+
+            debug('%s (time=%s, key=%s)', path, file_time, key)
+
+        dups = set()
+
+        for partition in found.values():
+            # Sort files within the partition by their time.
+            partition.sort(key=lambda i: i[1])
+
+            if len(partition) > 1:
+                # Find the maximum delta between file times.
+                max_delta = max(abs(partition[i][1] - partition[i-1][1])
+                                for i in xrange(1, len(partition)))
+            else:
+                max_delta = None
+
+            for i, (path, file_time) in enumerate(partition):
+                if not self.file_time_is_end_time:
+                    # File time is the beginning.
+                    file_begin = file_time
+
+                    try:
+                        # Assume the file ends at the instant the next file
+                        # begins.
+                        file_end = partition[i+1][1]
+                    except IndexError:
+                        # Can't be sure when the last file in the time series
+                        # ends.
+                        now = dtime_to_local(datetime.datetime.now())
+
+                        if max_delta:
+                            file_end = min(file_begin + max_delta, now)
+                        else:
+                            file_end = file_begin + datetime.timedelta(days=2)
+                else:
+                    # File time is the end.
+                    file_end = file_time
+
+                    try:
+                        # Assume the file begins at the instant the previous
+                        # file ends.
+                        file_begin = partition[i-1][1]
+                    except IndexError:
+                        # Can't be sure when the first file in the time series
+                        # begins.
+                        if max_delta:
+                            file_begin = max(file_end - max_delta, 0)
+                        else:
+                            file_begin = file_end - datetime.timedelta(days=2)
+
+                if ((end is None or file_begin <= end) and
+                    (begin is None or begin <= file_end)):
+                    # Check for dups (same file size and name).
+                    key = os.path.basename(path), os.path.getsize(path)
+                    if not key in dups:
+                        dups.add(key)
+                        debug('%s (begin=%s, end=%s)', path, file_begin,
+                              file_end)
+                        yield (path, file_begin, file_end)
+                    else:
+                        debug('skipping duplicate file %s', path)
+
+                if end is not None and file_begin > end:
+                    # The remaining files begin after `end`.
+                    break
+
+
+class DataSource(object):
+
+    """Data source. """
+
+    def __init__(self, name, descriptors):
+        self.name = name
+        self.descriptors = descriptors
+
+    def find(self):
+        """Yields the absolute paths of the files belonging to this data
+        source.
+
+        """
+        return chain.from_iterable(d.find() for d in self.descriptors)
+
+    def index(self, begin=None, end=None,
+              processes=multiprocessing.cpu_count()):
+        """Creates or updates the indexes used by this data source. """
+        map(lambda d: d.index(begin, end, processes), self.descriptors)
+
+    def _index_set(self):
+        """Returns a list of descriptors such that no two descriptors have the
+        same index.
+
+        It's possible for two descriptors to share an index. For some index
+        operations (e.g., querying), we only want to use each index once.
+
+        """
+        return dict((d.index_path, d) for d in self.descriptors).values()
+
+    def index_clean(self):
+        """Removes missing files from the indexes used by this data source. """
+        map(lambda d: d.index_clean(), self._index_set())
+
+    def index_search(self, begin=None, end=None):
+        """Yields a sequence of (PATH, BEGIN_DATETIME, END_DATETIME) tuples for
+        this data source. The begin and end times are derived from the data.
+
+        """
+        return chain.from_iterable(d.index_search(begin, end)
+                                   for d in self._index_set())
+
+    def fuzzy_search(self, begin=None, end=None):
+        """Yields a sequence of (PATH, BEGIN_DATETIME, END_DATETIME) tuples for
+        this data source. The begin and end times are derived from the file
+        paths.
+
+        """
+        return chain.from_iterable(d.fuzzy_search(begin, end)
+                                   for d in self.descriptors)
+
+
+def load_sources(config_path, spec_path):
+    """Loads predefined data sources from a configuration file. """
+    config = ConfigObj(config_path, configspec=spec_path)
+
+    if spec_path:
+        # Validate the configuration.
+        result = config.validate(Validator(), preserve_errors=True)
+        if result != True:
+            for section_list, key, error in flatten_errors(config, result):
+                print >> sys.stderr, 'ERROR: %s/%s; %s' % \
+                    (','.join(section_list), key, error)
+
+            raise ValueError('configuration error')
+
+    sources = {}
+
+    for name, value in config.items():
+        if not value.sections:
+            sections = [value]
+        else:
+            sections = [value[s] for s in value.sections]
+
+        descriptors = []
+        for section in sections:
+            descriptor = DataSourceDescriptor(name, section['paths'],
+                                              section['include'],
+                                              section['exclude'],
+                                              section['file_time_is_end_time'],
+                                              section['extractor'],
+                                              section['index_type'],
+                                              section['index_path'],
+                                              section['indexer'])
+            descriptors.append(descriptor)
+
+        sources[name] = DataSource(name, descriptors)
+
+    return sources
+
+
+def find_config_file(name):
+    """If found, returns the path of the config file. Otherwise, None is
+    returned.
+
+    """
+    dirnames = ['', '/etc/db', os.path.dirname(os.path.realpath(__file__))]
+
+    for dirname in dirnames:
+        path = os.path.join(dirname, name)
+        if os.path.exists(path):
+            return path
+
+    return None
+
+
+def main():
+    """Parses arguments and executes. """
+    global DEBUG
+
+    # Try to find the configuraton files.
+    default_config = find_config_file('timefind.conf')
+    default_spec = find_config_file('timefind.spec')
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('-c', '--config', metavar='PATH',
+                        help='configuration to load (default=%(default)s)',
+                        default=default_config)
+    parser.add_argument('-S', '--spec', metavar='PATH',
+                        help='configuration spec (default=%(default)s)',
+                        default=default_spec)
+    parser.add_argument('-d', '--debug', help='enable debug output',
+                        action='store_true', default=False)
+
+    subparsers = parser.add_subparsers()
+
+    sp_list = subparsers.add_parser('list', help='list data sources')
+    sp_list.set_defaults(mode='list')
+
+    sp_listx = subparsers.add_parser('listx', help='list extractors')
+    sp_listx.set_defaults(mode='listx')
+
+    sp_query = subparsers.add_parser('query', help='query data sources')
+    sp_query.add_argument('sources', nargs='+', metavar='SOURCE',
+                          help='sources to search')
+    sp_query.add_argument('-b', '--begin', metavar='TIMESTAMP',
+                          help='begin interval at TIMESTAMP')
+    sp_query.add_argument('-e', '--end', metavar='TIMESTAMP',
+                          help='end interval at TIMESTAMP')
+    sp_query.add_argument('-i', '--index', action='store_true',
+                          help='query using indexes')
+    sp_query.add_argument('--times', action='store_true', default=False,
+                          help='output the start and end time for each path')
+    sp_query.add_argument('--bytes', action='store_true', default=False,
+                          help='output in [DATE] [TOTAL BYTES] format')
+    sp_query.set_defaults(mode='query')
+
+    sp_index = subparsers.add_parser('index', help='index data sources')
+    sp_index.add_argument('sources', nargs='+', metavar='SOURCE',
+                          help='sources to search')
+    sp_index.add_argument('-P', '--processes', metavar='N',
+                          help='use N processes (default=%(default)s)',
+                          default=multiprocessing.cpu_count())
+    sp_index.add_argument('-b', '--begin', metavar='TIMESTAMP',
+                          help='begin interval at TIMESTAMP')
+    sp_index.add_argument('-e', '--end', metavar='TIMESTAMP',
+                          help='end interval at TIMESTAMP')
+    sp_index.add_argument('-c', '--clean', action='store_true',
+                          help='remove missing files from the index')
+    sp_index.set_defaults(mode='index')
+
+    args = parser.parse_args()
+
+    sources = load_sources(args.config, args.spec)
+
+    if args.debug:
+        DEBUG = True
+
+    if args.mode == 'list':
+        # List configured sources and exit.
+        names = sources.keys()
+        names.sort()
+
+        for name in names:
+            print name
+
+        return 0
+
+    if args.mode == 'listx':
+        # List custom extractors and exit.
+        fmt = '{:15s} {:s}'
+        print fmt.format('Extractor', 'Description')
+        print
+
+        names = EXTRACTORS.keys()
+        names.sort()
+        for name in names:
+            description = EXTRACTORS[name]['desc']
+            print fmt.format(name, description)
+
+        return 0
+
+    # Verify that all sources are configured.
+    for source in args.sources:
+        if not source in sources:
+            raise ValueError('source "%s" is not configured' % source)
+
+    begin = extract_dtime(args.begin)
+    end = extract_dtime(args.end)
+
+    if args.mode == 'index':
+        # Create and/or update indexes and exit.
+        for source in args.sources:
+            if args.clean:
+                sources[source].index_clean()
+
+            sources[source].index(begin, end, args.processes)
+
+        return 0
+
+    assert args.mode == 'query'
+
+    if args.bytes:
+        # Need times to do bytes per day.
+        args.times = True
+
+    bytes_per_day = {}
+    def handle_items(items):
+        """Processes items returned by the search. """
+        for path, file_begin, file_end in items:
+            if args.bytes:
+                date = file_begin.date()
+                if not date in bytes_per_day:
+                    bytes_per_day[date] = 0
+                bytes_per_day[date] += os.path.getsize(path)
+            elif args.times:
+                print '%s\t%.5f\t%.5f' % (path, dtime_to_epoch(file_begin),
+                                          dtime_to_epoch(file_end))
+            else:
+                print path
+
+    for source in args.sources:
+        if args.index:
+            # Query the index.
+            method = sources[source].index_search
+        else:
+            # Fuzzy search.
+            method = sources[source].fuzzy_search
+
+        handle_items(method(begin, end))
+
+    if args.bytes:
+        if (not begin or not end) and not bytes_per_day:
+            # No dates and no files.
+            return
+
+        if not begin:
+            begin = min(date for date in bytes_per_day)
+        else:
+            begin = begin.date()
+
+        if not end:
+            end = max(date for date in bytes_per_day)
+        else:
+            end = end.date()
+
+        while begin != end:
+            if begin in bytes_per_day:
+                count = bytes_per_day[begin]
+            else:
+                count = 0
+
+            print '%s\t%d' % (str(begin), count)
+            begin += datetime.timedelta(days=1)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
