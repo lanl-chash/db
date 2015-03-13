@@ -118,7 +118,7 @@ The following libraries are included in the source tree.
 License
 -------
 
-Copyright &copy; 2014 Los Alamos National Security, LLC.
+Copyright &copy; 2015, Los Alamos National Security, LLC.
 
 This software is licensed under the MIT License. See the LICENSE file for more
 information.
